@@ -4,7 +4,6 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY ui/ ui/
-COPY data/ data/
 ARG CARGO_BUILD_JOBS=4
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/src/target \
     touch src/lib.rs src/main.rs && cargo build --locked --release && install -m 0755 target/release/claud2api /claud2api

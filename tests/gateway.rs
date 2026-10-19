@@ -2912,6 +2912,14 @@ async fn truncated_internal_generation_cannot_start_business_or_retire_known_con
 #[tokio::test]
 async fn model_reads_consume_account_admission_pacing() {
     let f = fixture(1).await;
+    f.engine
+        .store
+        .mutate("", json!({}), |state| {
+            state.settings.account_min_interval_seconds = 300;
+            Ok(())
+        })
+        .await
+        .unwrap();
     for expected in [200, 429] {
         let response = web::public(f.engine.clone())
             .oneshot(
