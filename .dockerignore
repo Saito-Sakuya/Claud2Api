@@ -1,0 +1,14 @@
+**
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**/*.rs
+!ui/
+!ui/*.html
+!ui/*.css
+!ui/*.js
+!ui/*.svg
+!LICENSE
+!THIRD_PARTY.md
+!LICENSES/
+!LICENSES/**

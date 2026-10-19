@@ -1,0 +1,28 @@
+name: Build Claud2Api
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    container: rust:1-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29
+    env:
+      CARGO_BUILD_JOBS: 4
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake perl pkg-config libclang-dev python3 binutils
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+      - run: python3 scripts/update_acceptance.py --artifacts /tmp/update-acceptance --build
+      - run: cargo build --locked --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: claud2api-linux-amd64
+          path: target/release/claud2api

@@ -1,0 +1,47 @@
+# Local secrets and captures
+/.local/
+/secrets/
+/dist/
+__pycache__/
+*.pyc
+.venv/
+*.har
+.env
+.env.*
+captured/
+.claude/
+.workbuddy/
+# Binaries
+*.exe
+*.exe~
+claude2api
+claude2api-test
+accounts.txt
+# Logs / temp
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+claude.ai.har
+# IDE
+.vscode/
+.idea/
+.sticky-*
+sticky-sessions.json
+
+claud2api
+session.txt
+gateway-key.txt
+admin-key.txt
+bot-key.txt
+/target/
+/output/
+/release/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+instance.lock
+accounts.pending.txt
+*.pem
+*.key
+*.cookie

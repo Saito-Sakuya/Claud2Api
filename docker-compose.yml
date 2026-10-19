@@ -1,0 +1,40 @@
+# Linux VPS: both listeners stay on host loopback; use an SSH tunnel for control.
+services:
+  claud2api:
+    build: .
+    image: claud2api:0.1.0-alpha.3
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    user: "${CLAUD2API_UID:-65532}:${CLAUD2API_GID:-65532}"
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 1
+    stop_grace_period: 35s
+    secrets: [gateway_key, admin_key, accounts]
+    volumes:
+      - "${CLAUD2API_STATE_DIR:?Set a protected state directory}:/var/lib/claud2api"
+    environment:
+      BIND_HOST: 127.0.0.1
+      PORT: "${GATEWAY_PORT:-18081}"
+      CONTROL_BIND: "127.0.0.1:${CONTROL_PORT:-18082}"
+      CLAUD2API_DATA_DIR: /var/lib/claud2api
+      GATEWAY_API_KEY_FILE: /run/secrets/gateway_key
+      ADMIN_API_KEY_FILE: /run/secrets/admin_key
+      CLAUDE_ACCOUNTS_FILE: /run/secrets/accounts
+      SIMULATED_CACHE_ENABLED: "${SIMULATED_CACHE_ENABLED:-true}"
+      CLAUDE_TIMEZONE: "${CLAUDE_TIMEZONE:-Asia/Taipei}"
+      CLAUDE_LOCALE: "${CLAUDE_LOCALE:-zh-CN}"
+      CLAUD2API_UPDATE_REPOSITORY: "${CLAUD2API_UPDATE_REPOSITORY:-Saito-Sakuya/Claud2Api}"
+      CLAUD2API_UPDATE_DISABLED: "${CLAUD2API_UPDATE_DISABLED:-false}"
+secrets:
+  gateway_key:
+    file: "${GATEWAY_API_KEY_FILE:?Set a protected gateway key file}"
+  admin_key:
+    file: "${ADMIN_API_KEY_FILE:?Set a different protected admin key file}"
+  accounts:
+    file: "${CLAUDE_ACCOUNTS_FILE:?Set a protected accounts file}"

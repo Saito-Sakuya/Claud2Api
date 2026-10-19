@@ -1,0 +1,51 @@
+[package]
+name = "claud2api"
+version = "0.1.0-alpha.4"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+description = "A small stateful protocol gateway with a private control room"
+
+[dependencies]
+axum = { version = "=0.8.9", features = ["json", "http1", "tokio"] }
+axum-server = "=0.8.0"
+hyper-util = { version = "=0.1.21", features = ["tokio"] }
+tokio = { version = "=1.53.3", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync", "fs", "process", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled"] }
+wreq = { version = "=0.16.1", default-features = false, features = ["tokio-rt", "chromium-roots", "cookies", "gzip", "deflate", "brotli", "zstd", "stream", "json", "socks"] }
+wreq-util = { git = "https://github.com/0x676e67/wreq-util", rev = "8dbbfe9d945ef36a6293951251802ebea19948e0", default-features = false, features = ["emulation", "tokio-rt", "emulation-compression", "emulation-chromium-pki"] }
+futures-util = "0.3"
+async-stream = "0.3"
+bytes = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+subtle = "2"
+aes-gcm = "0.10"
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
+chrono-tz = "=0.10.4"
+jsonschema = { version = "=0.59.0", default-features = false }
+regex = "1"
+url = "2"
+httpdate = "1"
+fslock = "0.2.1"
+
+[patch.crates-io]
+wreq = { git = "https://github.com/0x676e67/wreq", rev = "cd76bcdf1307153de289d34e072528bdf0510a3b" }
+btls = { git = "https://github.com/0x676e67/btls", rev = "129887582a538b8f4dcf371d15c953335312ca37" }
+btls-sys = { git = "https://github.com/0x676e67/btls", rev = "129887582a538b8f4dcf371d15c953335312ca37" }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

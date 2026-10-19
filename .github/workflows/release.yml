@@ -1,0 +1,73 @@
+name: Publish compatible release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    container: rust:1-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29
+    env:
+      CARGO_BUILD_JOBS: 4
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update && apt-get install -y --no-install-recommends cmake perl pkg-config libclang-dev python3 binutils
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked --all-targets
+      - run: python3 scripts/update_acceptance.py --artifacts /tmp/update-acceptance --build
+      - run: cargo build --locked --release
+      - name: Prepare verified assets
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 scripts/package_release.py --binary target/release/claud2api --tag "$RELEASE_TAG"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: release/*
+          if-no-files-found: error
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('node:fs');
+            const crypto = require('node:crypto');
+            const tag = context.ref.replace('refs/tags/', '');
+            const manifest = JSON.parse(fs.readFileSync('release/claud2api-update.json', 'utf8'));
+            if (manifest.version !== tag) throw new Error('Tag and manifest disagree');
+            const repo = {...context.repo};
+            let release;
+            try {
+              release = (await github.rest.repos.getReleaseByTag({...repo, tag})).data;
+              if (!release.draft) throw new Error('Published releases are immutable; use a new version');
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              release = (await github.rest.repos.createRelease({...repo, tag_name: tag,
+                name: tag, draft: true, prerelease: tag.split('+')[0].includes('-'),
+                body: 'Compatible Linux AMD64 release. See UPDATES.md / UPDATES_ZH.md for managed updates and rollback.'})).data;
+            }
+            // Keep the draft invisible until every asset has its expected digest.
+            for (const name of ['claud2api-linux-amd64', 'claud2api-update.json', 'SHA256SUMS']) {
+              const existing = release.assets.find(asset => asset.name === name);
+              if (existing) await github.rest.repos.deleteReleaseAsset({...repo, asset_id: existing.id});
+              const data = fs.readFileSync('release/' + name);
+              const asset = (await github.rest.repos.uploadReleaseAsset({...repo,
+                release_id: release.id, name, data,
+                headers: {'content-type': 'application/octet-stream', 'content-length': data.length}})).data;
+              const expected = 'sha256:' + crypto.createHash('sha256').update(data).digest('hex');
+              if (asset.digest !== expected || asset.size !== data.length || asset.state !== 'uploaded')
+                throw new Error('GitHub asset verification failed: ' + name);
+            }
+            await github.rest.repos.updateRelease({...repo, release_id: release.id, draft: false});

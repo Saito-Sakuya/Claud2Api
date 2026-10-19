@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Claud2Api · 管理控制台</title>
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/style.css" />
+    <script defer src="/app.js"></script>
+    <script defer src="/charts.js"></script>
+    <script defer src="/selects.js"></script>
+  </head>
+  <body>
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="/" aria-label="Claud2Api 控制台">
+        <img src="/icon.svg" width="36" height="36" alt="Claud2Api" />
+        <span class="brand-name">Claud2Api</span>
+      </a>
+      <button id="version-entry" class="version-entry" type="button" aria-haspopup="dialog" title="打开版本管理">
+        <span class="version-copy"><span class="version-label">版本管理</span><span id="version-number">v0.1.0-alpha.4</span></span><span class="version-symbol" aria-hidden="true">↻</span>
+      </button>
+      <button
+        class="collapse-button"
+        id="collapse"
+        aria-label="折叠导航"
+        aria-expanded="true"
+        title="折叠导航"
+      >
+        ‹
+      </button>
+      <nav aria-label="主导航">
+        <button data-tab="overview" class="selected" title="运行概览">
+          <span class="nav-symbol">◫</span
+          ><span class="nav-label">运行概览</span>
+        </button>
+        <button data-tab="accounts" title="账号池">
+          <span class="nav-symbol">◉</span><span class="nav-label">账号池</span>
+        </button>
+        <button data-tab="sessions" title="粘性会话">
+          <span class="nav-symbol">▤</span
+          ><span class="nav-label">粘性会话</span>
+        </button>
+        <button data-tab="settings" title="运行配置">
+          <span class="nav-symbol">⚙</span
+          ><span class="nav-label">运行配置</span>
+        </button>
+        <button data-tab="models" title="模型配置">
+          <span class="nav-symbol">◇</span
+          ><span class="nav-label">模型配置</span>
+        </button>
+        <button data-tab="tokens" title="令牌管理">
+          <span class="nav-symbol">⚿</span
+          ><span class="nav-label">令牌管理</span>
+        </button>
+        <button data-tab="logs" title="消息日志">
+          <span class="nav-symbol">≋</span
+          ><span class="nav-label">消息日志</span>
+        </button>
+        <button data-tab="events" title="操作记录">
+          <span class="nav-symbol">◷</span
+          ><span class="nav-label">操作记录</span>
+        </button>
+      </nav>
+      <div class="sidebar-bottom">
+        <button id="logout" class="quiet" hidden>退出</button>
+      </div>
+    </aside>
+    <div class="workspace">
+      <header>
+        <div class="connection" role="status" aria-live="polite">
+          <span class="traffic" id="traffic" aria-hidden="true"
+            ><i class="red"></i><i class="green"></i
+          ></span>
+          <div>
+            <strong id="connection">未连接</strong
+            ><small id="last-update">尚未同步</small>
+          </div>
+        </div>
+        <div class="header-controls" id="refresh-controls" hidden>
+          <label for="refresh-interval">自动刷新</label>
+          <select id="refresh-interval" aria-label="自动刷新间隔">
+            <option value="5">5 秒</option>
+            <option value="10">10 秒</option>
+            <option value="20" selected>20 秒</option>
+            <option value="30">30 秒</option>
+            <option value="60">60 秒</option>
+          </select>
+          <button id="refresh" class="quiet">立即刷新</button>
+        </div>
+      </header>
+      <main>
+        <section id="login" class="login-panel glass">
+          <div class="section-label">Claud2Api · v0.1.0-alpha.4</div>
+          <h1>登录管理控制台</h1>
+          <p>请通过 SSH 隧道访问，并使用独立管理密钥登录。</p>
+          <form id="login-form">
+            <label for="key">管理密钥</label>
+            <input
+              id="key"
+              type="password"
+              autocomplete="off"
+              minlength="32"
+              required
+              placeholder="输入管理密钥"
+            />
+            <button type="submit" id="login-button">连接</button>
+          </form>
+        </section>
+        <div id="console" hidden>
+          <section id="overview" class="tab">
+            <div class="page-title">
+              <div>
+                <div class="section-label">OVERVIEW</div>
+                <h1>运行概览</h1>
+              </div>
+              <span class="badge">本地估算</span>
+            </div>
+            <p>
+              按 API
+              令牌区分使用者。用量和金额均为本地模拟，不代表平台剩余额度或实际账单。
+            </p>
+            <div class="filter-bar glass overview-filters">
+              <div>
+                <label for="usage-range">统计范围</label
+                ><select id="usage-range">
+                  <option value="today">今天</option>
+                  <option value="24h" selected>最近 24h</option>
+                  <option value="7d">最近 7d</option>
+                  <option value="month">本月</option>
+                  <option value="last_month">上月</option>
+                  <option value="all">运行以来</option>
+                </select>
+              </div>
+              <span id="usage-window" class="muted"></span>
+            </div>
+            <div id="metrics" class="metrics"></div>
+            <div class="panel glass">
+              <div class="panel-heading chart-heading">
+                <div>
+                  <h2>令牌用量趋势</h2>
+                  <small>趋势窗口独立于上方统计范围，点击图例可隐藏曲线</small>
+                </div>
+                <div class="chart-controls">
+                  <div>
+                    <label for="usage-granularity">趋势粒度</label
+                    ><select id="usage-granularity">
+                      <option value="hour">按小时 · 24 点</option>
+                      <option value="day">按天 · 7 点</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label for="usage-metric">曲线指标</label
+                    ><select id="usage-metric">
+                      <option value="tokens">总 Token</option>
+                      <option value="input">输入 Token</option>
+                      <option value="output">输出 Token</option>
+                      <option value="cost">模拟金额 USD</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+              <div id="usage-trend" class="chart-surface"></div>
+              <div id="usage-legend" class="chart-legend"></div>
+            </div>
+            <div class="analytics-grid">
+              <div class="panel glass">
+                <div class="panel-heading">
+                  <h2>使用者用量占比</h2>
+                  <span class="muted">输入 + 输出 Token</span>
+                </div>
+                <div id="usage-donut" class="donut-layout"></div>
+              </div>
+              <div class="panel glass">
+                <div class="panel-heading">
+                  <h2>模拟费用明细</h2>
+                  <span class="muted">USD · 已计价小计</span>
+                </div>
+                <div id="cost-breakdown" class="table-wrap"></div>
+                <p class="muted" id="cost-note"></p>
+              </div>
+            </div>
+            <div class="panel glass">
+              <div class="panel-heading">
+                <h2>令牌用量分布</h2>
+                <span class="muted">含内部压缩用量</span>
+              </div>
+              <div id="token-usage-table" class="table-wrap"></div>
+            </div>
+            <div class="panel glass">
+              <div class="panel-heading">
+                <h2>账号用量分布</h2>
+                <span class="muted">所选统计范围</span>
+              </div>
+              <div id="usage-table" class="table-wrap"></div>
+            </div>
+            <p class="muted" id="usage-note"></p>
+          </section>
+          <section id="accounts" class="tab" hidden>
+            <div class="page-title">
+              <div>
+                <div class="section-label">ACCOUNTS</div>
+                <h1>账号池</h1>
+              </div>
+              <button id="show-import">导入账号</button>
+            </div>
+            <p>
+              每个账号严格串行。浏览器和代理配置仅能在账号空闲时修改，已有会话和有效缓存会保留。
+            </p>
+            <div class="panel glass">
+              <div class="batch-toolbar">
+                <button type="button" id="select-accounts" class="quiet">全选</button>
+                <button type="button" id="clear-accounts" class="quiet">清空选择</button>
+                <span id="account-selected" class="muted">已选 0 个</span>
+                <button type="button" id="show-batch-proxy" disabled>批量分配代理</button>
+              </div>
+              <div id="account-table" class="table-wrap"></div>
+            </div>
+            <form id="account-name-form" class="panel glass" hidden>
+              <h2>编辑账号名称</h2>
+              <label for="account-name">账号名称</label><input id="account-name" maxlength="80" required autocomplete="off" />
+              <div class="form-actions"><button type="submit">保存名称</button><button type="button" id="cancel-account-name" class="quiet">取消</button></div>
+            </form>
+            <form id="batch-proxy-form" class="panel glass" hidden>
+              <h2>批量分配代理</h2><p id="batch-proxy-targets" class="muted"></p>
+              <label for="batch-proxy-mode">连接方式</label><select id="batch-proxy-mode"><option value="replace">使用同一代理</option><option value="direct">全部直接连接</option></select>
+              <div id="batch-proxy-field"><label for="batch-proxy-url">代理 URL</label><input id="batch-proxy-url" type="password" autocomplete="off" required /></div>
+              <p class="muted">所有选中账号均空闲时才一起更新；任一冲突或配置无效时全部保持原值。浏览器配置和已有会话保持。</p>
+              <div class="form-actions"><button type="submit" id="save-batch-proxy">应用到选中账号</button><button type="button" id="cancel-batch-proxy" class="quiet">取消</button></div>
+            </form>
+            <form id="transport-form" class="panel glass" hidden>
+              <div class="panel-heading">
+                <h2 id="transport-title">账号连接配置</h2>
+                <button id="cancel-transport" type="button" class="quiet">
+                  关闭
+                </button>
+              </div>
+              <div class="fields">
+                <div class="field">
+                  <label for="account-label">账号名称</label
+                  ><input id="account-label" maxlength="80" required />
+                </div>
+                <div class="field">
+                  <label for="browser-profile">浏览器配置</label
+                  ><select id="browser-profile"></select>
+                </div>
+                <div class="field">
+                  <label for="proxy-mode">账号代理</label
+                  ><select id="proxy-mode">
+                    <option value="keep">保留当前设置</option>
+                    <option value="replace">设置代理</option>
+                    <option value="direct">直接连接</option></select
+                  ><small id="proxy-current"></small>
+                </div>
+                <div class="field" id="proxy-field" hidden>
+                  <label for="proxy-url">代理 URL</label
+                  ><input
+                    id="proxy-url"
+                    type="password"
+                    autocomplete="off"
+                    placeholder="socks5h://user:password@host:port"
+                  /><small
+                    >支持
+                    HTTP、HTTPS、SOCKS5、SOCKS5h。留存凭证不会回显。</small
+                  >
+                </div>
+              </div>
+              <button type="submit">保存账号配置</button
+              ><span class="form-note">不会清除会话、缓存或额度冷却。</span>
+            </form>
+            <form id="import-form" class="panel glass" hidden>
+              <div class="panel-heading">
+                <h2>导入账号</h2>
+                <button type="button" id="cancel-import" class="quiet">
+                  关闭
+                </button>
+              </div>
+              <label for="credentials"
+                >每行一个账号名:Session Key、Session Key 或完整 Cookie</label
+              >
+              <textarea
+                id="credentials"
+                rows="5"
+                autocomplete="off"
+                spellcheck="false"
+                required
+              ></textarea>
+              <div class="fields compact">
+                <div class="field">
+                  <label for="import-profile">浏览器配置</label
+                  ><select id="import-profile"></select>
+                </div>
+                <div class="field">
+                  <label for="import-proxy">代理 URL（可选）</label
+                  ><input
+                    id="import-proxy"
+                    type="password"
+                    autocomplete="off"
+                    placeholder="留空使用直接连接"
+                  />
+                </div>
+              </div>
+              <p class="muted">
+                重复账号跳过。凭证加密保存，导入后不提供回读。
+              </p>
+              <button type="submit">导入</button>
+            </form>
+          </section>
+          <section id="sessions" class="tab" hidden>
+            <div class="section-label">SESSIONS</div>
+            <h1>粘性会话</h1>
+            <p>默认空闲 1 小时后过期。执行中的会话不能手动清理。</p>
+            <div class="panel glass">
+              <div id="session-table" class="table-wrap"></div>
+            </div>
+          </section>
+          <section id="settings" class="tab" hidden>
+            <div class="page-title">
+              <div>
+                <div class="section-label">SETTINGS</div>
+                <h1>运行配置</h1>
+              </div>
+              <span id="settings-dirty" class="badge amber" hidden
+                >有未保存的修改</span
+              >
+            </div>
+            <p>修改影响后续请求。自动刷新不会覆盖正在编辑的配置。</p>
+            <form id="settings-form" class="panel glass">
+              <div id="settings-fields" class="fields"></div>
+              <button type="submit">保存配置</button
+              ><button type="button" id="reload-settings" class="quiet">
+                重载配置
+              </button>
+            </form>
+          </section>
+          <section id="models" class="tab" hidden>
+            <div class="section-label">MODELS</div>
+            <h1>模型配置</h1>
+            <p>
+              配置下游可见的模型 ID、显示名称及真实模型映射。生成响应中的 model
+              返回下游模型 ID；真实模型仍须在账号可用列表内。
+            </p>
+            <div class="panel glass">
+              <div class="panel-heading">
+                <h2>上游默认模型列表</h2>
+                <span class="muted" id="upstream-model-status">尚未获取</span>
+              </div>
+              <div class="fields compact">
+                <div>
+                  <label for="model-account">查询账号</label
+                  ><select id="model-account">
+                    <option value="">自动选择空闲账号</option>
+                  </select>
+                </div>
+              </div>
+              <div class="form-actions">
+                <button type="button" id="fetch-upstream-models">
+                  获取上游模型</button
+                ><button
+                  type="button"
+                  id="import-default-models"
+                  class="quiet"
+                  disabled
+                >
+                  将全部模型补入配置
+                </button>
+              </div>
+              <p class="muted">
+                点击后获取所选账号的完整目录，并将全部新模型补入下方草稿，保留已有修改和停用项；保存后生效。查询遵守账号串行与请求间隔，实际可用模型以执行账号权限为准。
+              </p>
+              <div id="upstream-model-table" class="table-wrap"></div>
+            </div>
+            <form id="model-form" class="panel glass">
+              <label class="inline-label"
+                ><input
+                  type="checkbox"
+                  id="model-mode"
+                />启用自定义模型列表和映射</label
+              >
+              <p>
+                关闭时返回账号原生列表。开启时只展示并接受已启用的配置项；修改条目会启用，保存后生效。下游
+                ID 可使用原生名称、自定义别名或 c2a-claude-*；上游模型请填写不带
+                c2a- 的真实名称。
+              </p>
+              <p>
+                列表以本次所选账号的实际权限为准。c2a- 保留给 claude-*；
+                其他自定义别名请使用其他前缀。
+              </p>
+              <span id="model-dirty" class="badge amber" hidden
+                >有未保存的修改</span
+              >
+              <div id="model-table" class="table-wrap"></div>
+              <div class="form-actions">
+                <button type="button" id="add-model" class="quiet">
+                  添加模型</button
+                ><button type="submit" id="save-models">保存模型配置</button
+                ><button type="button" id="reload-models" class="quiet">
+                  重载模型配置
+                </button>
+              </div>
+            </form>
+          </section>
+          <section id="tokens" class="tab" hidden>
+            <div class="section-label">API TOKENS</div>
+            <h1>令牌管理</h1>
+            <p>
+              为下游客户端创建独立 API
+              令牌。令牌并发与账号池限制同时生效；每个账号仍严格串行。环境网关密钥继续可用，本页令牌不能登录管理控制台。
+            </p>
+            <form id="token-form" class="panel glass">
+              <h2>新增令牌</h2>
+              <div class="fields">
+                <div>
+                  <label for="token-label">令牌名称</label
+                  ><input
+                    id="token-label"
+                    maxlength="80"
+                    required
+                    autocomplete="off"
+                  />
+                </div>
+                <div>
+                  <label for="token-concurrency">令牌并发数</label
+                  ><input
+                    id="token-concurrency"
+                    type="number"
+                    min="1"
+                    max="512"
+                    value="1"
+                    required
+                  />
+                </div>
+                <div>
+                  <label for="token-expiration">到期时间（本地时间）</label
+                  ><input
+                    id="token-expiration"
+                    type="datetime-local"
+                    required
+                  />
+                </div>
+                <label class="inline-label"
+                  ><input id="token-never" type="checkbox" />永不过期</label
+                >
+              </div>
+              <button type="submit" id="create-token">创建令牌</button>
+            </form>
+            <form id="token-edit-form" class="panel glass" hidden>
+              <h2>编辑令牌</h2><p class="muted">保留原密钥及会话，修改仅影响后续接入。降低并发时，已开始的请求正常结束。</p>
+              <div class="fields"><div><label for="token-edit-label">令牌名称</label><input id="token-edit-label" maxlength="80" required autocomplete="off" /></div>
+              <div><label for="token-edit-concurrency">令牌并发数</label><input id="token-edit-concurrency" type="number" min="1" max="512" required /></div>
+              <div><label for="token-edit-expiration">到期时间（本地时间）</label><input id="token-edit-expiration" type="datetime-local" required /></div>
+              <label class="inline-label"><input id="token-edit-never" type="checkbox" />永不过期</label></div>
+              <div class="form-actions"><button type="submit" id="save-token-edit">保存令牌</button><button type="button" id="cancel-token-edit" class="quiet">取消</button></div>
+            </form>
+            <div id="token-reveal" class="panel glass" hidden>
+              <h2>请保存新令牌</h2>
+              <p>完整令牌仅在创建后显示一次，关闭后无法再次查看。</p>
+              <input
+                id="token-secret"
+                type="password"
+                readonly
+                aria-label="新令牌"
+                autocomplete="off"
+              />
+              <div class="form-actions">
+                <button type="button" id="show-token" class="quiet">
+                  显示 / 隐藏</button
+                ><button type="button" id="copy-token" class="quiet">
+                  复制令牌</button
+                ><button type="button" id="dismiss-token">
+                  已保存，关闭显示
+                </button>
+              </div>
+            </div>
+            <div class="panel glass">
+              <h2>已创建令牌</h2>
+              <p>
+                删除或到期后拒绝新请求，已经开始的请求可正常结束。各令牌的会话相互隔离。
+              </p>
+              <div id="token-table" class="table-wrap"></div>
+            </div>
+            <div class="panel glass">
+              <h2>模型名称与 c2a- 前缀</h2>
+              <p>
+                直接调用可使用账号支持的原生名称，例如
+                <code>claude-haiku-5-5</code
+                >、<code>claude-sonnet-5-5</code>。需要区分桥接参数规则的客户端或中间服务可使用
+                <code>c2a-claude-haiku-5-5</code
+                >、<code>c2a-claude-sonnet-5-5</code>。
+              </p>
+              <p>
+                <code>c2a-</code>
+                是模型名称兼容前缀，与令牌无关，不会新增模型能力或额度。它是否影响客户端预校验取决于客户端实现。启用自定义模型配置后，请使用模型列表中发布的下游
+                ID。
+              </p>
+            </div>
+          </section>
+          <section id="logs" class="tab" hidden>
+            <div class="section-label">MESSAGE LOGS</div>
+            <h1>消息日志</h1>
+            <p>
+              Token
+              均为本地估算。上方显示输入与输出，下方显示模拟缓存读取与 1h 写入；缓存已从普通输入扣除，输入总量可悬停查看。上游只统计本次发送的提示词及收到的输出片段；未完成输出单独标记，未知不按零计量。日志不保存消息正文或凭证。
+            </p>
+            <div class="filter-bar glass">
+              <div>
+                <label for="log-level">状态分类</label
+                ><select id="log-level">
+                  <option value="all">全部</option>
+                  <option value="error">仅错误</option>
+                  <option value="normal">仅正常</option>
+                </select>
+              </div>
+              <div>
+                <label for="log-account">账号</label
+                ><select id="log-account">
+                  <option value="">全部账号</option>
+                </select>
+              </div>
+              <span class="muted" id="log-note"></span>
+            </div>
+            <div class="panel glass">
+              <div id="log-table" class="table-wrap"></div>
+              <button id="older-logs" class="quiet" hidden>加载更早记录</button>
+            </div>
+          </section>
+          <section id="events" class="tab" hidden>
+            <div class="section-label">AUDIT</div>
+            <h1>操作记录</h1>
+            <p>账号、配置及会话状态变更记录。</p>
+            <div class="panel glass">
+              <div id="event-table" class="table-wrap"></div>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+    <div id="notice" role="status" hidden></div>
+    <dialog id="version-dialog" class="version-dialog" aria-labelledby="version-title">
+      <div class="panel-heading"><h2 id="version-title">版本管理</h2><button id="version-close" class="quiet" type="button" aria-label="关闭版本管理">关闭</button></div>
+      <p id="version-current"></p>
+      <p id="version-check-status" role="status"></p>
+      <div id="version-options" class="version-options"></div>
+      <p id="version-draft-note" class="version-warning" hidden>请先保存或关闭未完成的编辑，并保存刚创建的令牌。</p>
+      <div id="version-job" class="version-job" hidden><strong id="version-job-label"></strong><progress id="version-progress" max="1" value="0"></progress><p id="version-job-detail"></p></div>
+      <p class="muted">更新与回退均保留现有数据，等待当前请求结束后切换。完成后面板自动重新载入。</p>
+      <div class="form-actions"><button id="version-apply" type="button" disabled>选择目标版本</button><button id="version-check" class="quiet" type="button">检查更新</button><button id="version-reload" class="quiet" type="button" hidden>重新载入面板</button></div>
+    </dialog>
+    <script defer src="/versions.js"></script>
+  </body>
+</html>

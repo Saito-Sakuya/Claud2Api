@@ -1,0 +1,13 @@
+chromium-roots
+
+The generated root certificate data and associated metadata are derived from
+the Chromium project and retain Chromium's BSD 3-Clause license. The exact
+source revision and files are recorded in chromium-crs/data/SOURCE.toml and the generated
+crate documentation.
+
+The certificate validation tests are independently adapted from the testing
+approach used by rustls/webpki-roots:
+https://github.com/rustls/webpki-roots
+
+The rustls/webpki-roots tooling is licensed under Apache-2.0 OR MIT. Its CCADB
+certificate data is not copied into this repository.
