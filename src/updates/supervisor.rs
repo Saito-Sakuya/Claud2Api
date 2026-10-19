@@ -1,6 +1,7 @@
 use super::{
     disk::{self, Installed, Registry, Transaction},
     github::{self, Listing, Release, Source},
+    policy::Policy,
     version::Version,
 };
 use crate::{
@@ -58,6 +59,7 @@ struct Job {
     target: Option<String>,
     error: Option<String>,
     recovered: bool,
+    automatic: bool,
     total: u64,
 }
 struct Manager {
@@ -65,6 +67,7 @@ struct Manager {
     root: PathBuf,
     source: Source,
     registry: Mutex<Registry>,
+    policy: Mutex<Policy>,
     catalog: Mutex<Catalog>,
     job: Mutex<Job>,
     target: Arc<RwLock<Option<Target>>>,
@@ -81,6 +84,18 @@ struct Apply {
     expected_version: String,
     target_version: String,
     catalog_revision: u64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyChange {
+    expected_revision: u64,
+    auto_patch: bool,
+}
+fn patch_choice<'a>(releases: &'a [Release], current: &Version) -> Option<&'a Release> {
+    releases.iter().find(|r| {
+        (!r.prerelease || current.prerelease())
+            && Version::parse(&r.version).is_some_and(|target| target.is_patch_of(current))
+    })
 }
 fn choices<'a>(
     releases: &'a [Release],
@@ -126,6 +141,8 @@ impl Manager {
         }
         let source = Source::load()?;
         let registry = Registry::load(&root)?;
+        let mut policy = Policy::load(&root)?;
+        policy.completed(&root, &registry.active.version)?;
         let pending = root.join("transaction.json");
         if pending.exists() {
             let transaction: Transaction = disk::read_json(&pending, 16384)?;
@@ -142,6 +159,7 @@ impl Manager {
             root,
             source,
             registry: Mutex::new(registry),
+            policy: Mutex::new(policy),
             catalog: Mutex::new(Catalog::default()),
             job: Mutex::new(Job {
                 phase: "idle",
@@ -340,20 +358,86 @@ impl Manager {
             }
         }
         self.checking.store(false, Ordering::Release);
+        let checked = catalog.error.is_none();
+        drop(catalog);
+        if checked {
+            self.maybe_auto_patch().await;
+        }
+    }
+    async fn maybe_auto_patch(self: &Arc<Self>) {
+        if self.source.disabled || self.stop.is_cancelled() || self.busy.load(Ordering::Acquire) {
+            return;
+        }
+        let registry = self.registry.lock().await;
+        let Some(current) = Version::parse(&registry.active.version) else {
+            return;
+        };
+        let catalog = self.catalog.lock().await;
+        let policy = self.policy.lock().await;
+        if !policy.enabled || catalog.error.is_some() || catalog.checked_at == 0 {
+            return;
+        }
+        let candidate = catalog.releases.iter().find(|r| {
+            (!r.prerelease || current.prerelease())
+                && Version::parse(&r.version).is_some_and(|target| target.is_patch_of(&current))
+                && !policy.blocked_versions.contains(&r.version)
+        });
+        let Some(release) = candidate else { return };
+        let input = Apply {
+            expected_version: registry.active.version.clone(),
+            target_version: release.version.clone(),
+            catalog_revision: catalog.revision,
+        };
+        drop(policy);
+        drop(catalog);
+        drop(registry);
+        // accept rechecks the catalog, policy and current version under their locks.
+        let _ = self.accept_kind(input, true).await;
+    }
+    async fn change_policy(self: &Arc<Self>, input: PolicyChange) -> Result<()> {
+        if self.source.disabled {
+            return Err(Fault::new(409, "api_error", "managed updates are disabled"));
+        }
+        let mut policy = self.policy.lock().await;
+        if self.busy.load(Ordering::Acquire) {
+            return Err(Fault::new(
+                409,
+                "api_error",
+                "a version change is already running",
+            ));
+        }
+        if policy.revision != input.expected_revision {
+            return Err(Fault::new(
+                409,
+                "api_error",
+                "update policy changed; check again",
+            ));
+        }
+        policy.set_enabled(&self.root, input.auto_patch)?;
+        drop(policy);
+        if input.auto_patch {
+            self.maybe_auto_patch().await;
+        }
+        Ok(())
     }
     async fn status(&self) -> Value {
         let registry = self.registry.lock().await;
         let current = Version::parse(&registry.active.version).expect("validated registry");
         let catalog = self.catalog.lock().await;
         let (latest, previous) = choices(&catalog.releases, &current);
+        let patch = patch_choice(&catalog.releases, &current);
+        let policy = self.policy.lock().await;
         let previous: Vec<_> = previous
             .into_iter()
             .map(|r| json!({"version":r.version,"published_at":r.published_at}))
             .collect();
         let job = self.job.lock().await.clone();
-        json!({"schema_version":1,"repository":self.source.repository,"current_version":registry.active.version,"supervisor_version":crate::VERSION,"protocol":super::PROTOCOL,"enabled":!self.source.disabled,"checking":self.checking.load(Ordering::Acquire),"checked_at":catalog.checked_at,"next_check_at":catalog.next_check,"check_interval_seconds":300,"catalog_revision":catalog.revision,"check_error":catalog.error,"history_truncated":catalog.truncated,"update_available":latest.is_some(),"latest":latest.map(|r|json!({"version":r.version,"published_at":r.published_at})),"rollback_versions":previous,"busy":self.busy.load(Ordering::Acquire),"job":job,"downloaded":self.downloaded.load(Ordering::Relaxed)})
+        json!({"schema_version":1,"repository":self.source.repository,"current_version":registry.active.version,"supervisor_version":crate::VERSION,"protocol":super::PROTOCOL,"enabled":!self.source.disabled,"auto_patch_supported":true,"auto_patch":{"enabled":policy.enabled,"revision":policy.revision,"blocked_versions":policy.blocked_versions},"patch_update":patch.map(|r|json!({"version":r.version,"published_at":r.published_at})),"checking":self.checking.load(Ordering::Acquire),"checked_at":catalog.checked_at,"next_check_at":catalog.next_check,"check_interval_seconds":300,"catalog_revision":catalog.revision,"check_error":catalog.error,"history_truncated":catalog.truncated,"update_available":latest.is_some(),"latest":latest.map(|r|json!({"version":r.version,"published_at":r.published_at})),"rollback_versions":previous,"busy":self.busy.load(Ordering::Acquire),"job":job,"downloaded":self.downloaded.load(Ordering::Relaxed)})
     }
     async fn accept(self: &Arc<Self>, input: Apply) -> Result<Value> {
+        self.accept_kind(input, false).await
+    }
+    async fn accept_kind(self: &Arc<Self>, input: Apply, automatic: bool) -> Result<Value> {
         if self.source.disabled {
             return Err(Fault::new(409, "api_error", "managed updates are disabled"));
         }
@@ -377,21 +461,29 @@ impl Manager {
         let target = Version::parse(&input.target_version)
             .ok_or_else(|| Fault::invalid("invalid release version"))?;
         let (latest, previous) = choices(&catalog.releases, &current);
+        let patch = patch_choice(&catalog.releases, &current);
         let eligible = latest.is_some_and(|r| r.version == input.target_version)
+            || patch.is_some_and(|r| r.version == input.target_version)
             || previous.iter().any(|r| r.version == input.target_version);
-        if target == current || !eligible {
-            return Err(Fault::new(
-                409,
-                "api_error",
-                "target is not the latest update or one of the two preceding releases",
-            ));
-        }
         let release = catalog
             .releases
             .iter()
             .find(|r| r.version == input.target_version)
             .cloned()
-            .ok_or_else(Fault::internal)?;
+            .ok_or_else(|| Fault::new(409, "api_error", "target release is not in the catalog"))?;
+        let mut policy = self.policy.lock().await;
+        let automatic_eligible = policy.enabled
+            && target.is_patch_of(&current)
+            && (!release.prerelease || current.prerelease())
+            && !policy.blocked_versions.contains(&input.target_version)
+            && catalog.error.is_none();
+        if target == current || (automatic && !automatic_eligible) || (!automatic && !eligible) {
+            return Err(Fault::new(
+                409,
+                "api_error",
+                "target is not an eligible patch, latest update or preceding release",
+            ));
+        }
         if self.busy.swap(true, Ordering::AcqRel) {
             return Err(Fault::new(
                 409,
@@ -399,6 +491,12 @@ impl Manager {
                 "a version change is already running",
             ));
         }
+        if let Err(f) = policy.attempted(&self.root, &release.version, target < current, automatic)
+        {
+            self.busy.store(false, Ordering::Release);
+            return Err(f);
+        }
+        drop(policy);
         drop(catalog);
         drop(registry);
         let id = uuid::Uuid::new_v4().to_string();
@@ -406,12 +504,21 @@ impl Manager {
             id: Some(id.clone()),
             phase: "queued",
             target: Some(release.version.clone()),
+            automatic,
             ..Default::default()
         };
         self.downloaded.store(0, Ordering::Relaxed);
         let manager = self.clone();
         tokio::spawn(async move {
+            let version = release.version.clone();
             let result = manager.apply(release).await;
+            if result.is_ok() {
+                let _ = manager
+                    .policy
+                    .lock()
+                    .await
+                    .completed(&manager.root, &version);
+            }
             let mut job = manager.job.lock().await;
             match result {
                 Ok(()) => job.phase = "completed",
@@ -691,6 +798,25 @@ async fn apply(State(manager): State<Arc<Manager>>, request: Request) -> Respons
     crate::control::secure(&mut response);
     response
 }
+async fn policy(State(manager): State<Arc<Manager>>, request: Request) -> Response {
+    if let Err(f) = authorize(&manager, &request) {
+        return f.into_response();
+    }
+    let bytes = match axum::body::to_bytes(request.into_body(), 4096).await {
+        Ok(b) => b,
+        Err(_) => return Fault::invalid("invalid update policy request").into_response(),
+    };
+    let input = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return Fault::invalid("invalid update policy request").into_response(),
+    };
+    let mut response = match manager.change_policy(input).await {
+        Ok(()) => Json(manager.status().await).into_response(),
+        Err(f) => f.into_response(),
+    };
+    crate::control::secure(&mut response);
+    response
+}
 fn strip_hop(headers: &mut HeaderMap) {
     let extra: Vec<_> = headers
         .get("connection")
@@ -789,6 +915,7 @@ pub async fn run(config: Config, stop: CancellationToken) -> Result<()> {
         .route("/control/v1/updates", get(status))
         .route("/control/v1/updates/check", post(check))
         .route("/control/v1/updates/apply", post(apply))
+        .route("/control/v1/updates/policy", post(policy))
         .fallback(private_proxy)
         .layer(DefaultBodyLimit::max(4096))
         .layer(axum::middleware::from_fn(

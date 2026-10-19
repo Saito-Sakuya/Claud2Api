@@ -57,6 +57,22 @@ impl Version {
     pub fn prerelease(&self) -> bool {
         !self.pre.is_empty()
     }
+    pub fn is_patch_of(&self, current: &Self) -> bool {
+        if self <= current {
+            return false;
+        }
+        if self.pre.is_empty() && current.pre.is_empty() {
+            return self.core[..2] == current.core[..2];
+        }
+        self.core == current.core
+            && self.pre.len() == 3
+            && matches!(current.pre.len(), 2 | 3)
+            && matches!(self.pre[0].as_str(), "alpha" | "beta" | "rc")
+            && self.pre[..2] == current.pre[..2]
+            && self.pre[1].bytes().all(|c| c.is_ascii_digit())
+            && self.pre[2].bytes().all(|c| c.is_ascii_digit())
+            && (current.pre.len() == 2 || current.pre[2].bytes().all(|c| c.is_ascii_digit()))
+    }
 }
 impl Ord for Version {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -122,6 +138,43 @@ mod tests {
             "1.0.0+..",
         ] {
             assert!(Version::parse(bad).is_none(), "{bad}");
+        }
+    }
+    #[test]
+    fn automatic_patches_stay_in_the_current_release_line() {
+        for (current, target) in [
+            ("0.1.0-alpha.6", "0.1.0-alpha.6.1"),
+            ("0.1.0-alpha.6.1", "0.1.0-alpha.6.12"),
+            ("1.0.0-beta.2", "1.0.0-beta.2.1"),
+            ("1.0.0-rc.1.1", "1.0.0-rc.1.2"),
+            ("0.1.0", "0.1.1"),
+            ("1.2.3", "1.2.9"),
+        ] {
+            assert!(
+                Version::parse(target)
+                    .unwrap()
+                    .is_patch_of(&Version::parse(current).unwrap())
+            );
+        }
+        for (current, target) in [
+            ("0.1.0-alpha.6", "0.1.0-alpha.7"),
+            ("0.1.0-alpha.6.1", "0.1.0-alpha.7.1"),
+            ("0.1.0-alpha.6.2", "0.1.0-alpha.6.1"),
+            ("0.1.0-alpha.6.1", "0.1.0-alpha.6.1"),
+            ("0.1.0-alpha.6", "0.1.0-beta.6.1"),
+            ("0.1.0-alpha.6", "0.1.0"),
+            ("0.1.0-alpha.6", "0.1.1-alpha.6.1"),
+            ("0.1.0-alpha.6", "0.1.0-alpha.6.fix"),
+            ("0.1.0-alpha.6", "0.1.0-alpha.6.1.1"),
+            ("1.2.3", "1.3.0"),
+            ("1.2.3", "2.2.4"),
+            ("1.2.3", "1.2.4-rc.1"),
+        ] {
+            assert!(
+                !Version::parse(target)
+                    .unwrap()
+                    .is_patch_of(&Version::parse(current).unwrap())
+            );
         }
     }
 }

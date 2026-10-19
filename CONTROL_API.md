@@ -230,12 +230,18 @@ priced_uncached_input、priced_output、priced_cache_creation、priced_cache_rea
 
 ## 版本管理
 
-仅管理员可用：`GET /updates`、`POST /updates/check`、`POST /updates/apply`。
+仅管理员可用：`GET /updates`、`POST /updates/check`、`POST /updates/apply`、`POST /updates/policy`。
 Bot 及公开 API 凭证无权访问。检查及应用返回 202；应用须提交 GET 返回的
 `expected_version`、`target_version` 及 `catalog_revision`。版本或目录过期、
 非提供的目标及并发切换返回 409，格式错误返回 400。GET 包含 `current_version`、
 `supervisor_version`、`repository`、`enabled`、`checking`、检查时间、`check_error`、
 `update_available`、`latest`、最多两个 `rollback_versions`、`catalog_revision`、
 `busy`、`job` 及下载进度。失败任务恢复成功时可返回 `recovered:true`。
+支持自动补丁的守护进程另返回 `auto_patch_supported:true`、`auto_patch`（`enabled`、
+`revision`、`blocked_versions`）、`patch_update` 及 `job.automatic`。`patch_update` 与
+`latest` 可不同：前者为当前发行线补丁，后者可能是需要确认的功能版本。
+修改策略提交 `{"expected_revision":1,"auto_patch":false}`，使用 `auto_patch.revision`，
+成功返回 200；策略过期或正在切换返回 409。失败或中断的安装停止自动重试，手动更新仍可重试。
+手动回退会持久关闭自动补丁。旧守护进程缺少这些字段，面板提示升级基础程序。
 非支持平台独立运行返回 `enabled:false`；守护入口绝不暴露内部 `/_runtime/*` 操作。
 发布与数据规则见 [版本管理](UPDATES_ZH.md)。

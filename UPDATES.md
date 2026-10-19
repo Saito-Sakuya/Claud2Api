@@ -4,10 +4,12 @@
 
 ## Update
 
-The app checks for updates at startup and every five minutes. The version button
-at the top left glows amber when a newer version is available.
+The app checks at startup and every five minutes. Patches within the current
+release line install automatically, such as `alpha.6 → alpha.6.1`. Feature versions
+such as `alpha.7` still need confirmation. You can disable automatic patches in
+**版本管理**.
 
-1. Connect to the admin panel and click **版本管理** at the top left.
+1. The version button glows amber for an available update. Click **版本管理**.
 2. Select the new version and click update.
 3. Wait for it to finish. The panel reloads automatically.
 
@@ -18,7 +20,9 @@ requests finish before switching; new requests may wait briefly.
 
 You can open **版本管理** even without an update. Select an older version and click
 rollback. Your current data is kept. Up to two preceding published versions are
-offered; if none are available, there are no rollback choices.
+offered; if none are available, there are no rollback choices. Manual rollback
+disables automatic patches so the app does not immediately upgrade again. You can
+enable them again when ready.
 
 ## Before you start
 
@@ -27,7 +31,13 @@ key, and leave enough disk space for downloads and backups.
 
 Failed downloads or an unreachable GitHub leave the service running. If the new
 version fails to start, the app tries to restore the original version automatically.
+An unfinished patch is not retried automatically; retry it in the panel, or wait
+for a newer patch, which remains eligible for automatic installation.
 If a version requires a manual upgrade, follow its release notes.
+
+To enable automatic patches on an older installation, update the container image
+or base executable once, retaining the state directory and keys. Updating only the
+worker under an old supervisor cannot add this capability; the panel explains this.
 
 For development, publishing and manual recovery, see the
 [developer guide](DEVELOPMENT.md#managed-version-changes).

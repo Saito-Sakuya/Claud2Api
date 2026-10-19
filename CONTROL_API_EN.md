@@ -302,13 +302,22 @@ No provider query is made. See [accounting examples](USAGE_ANALYTICS_EN.md).
 
 ## Version management
 
-Administrator only: `GET /updates`, `POST /updates/check`, `POST /updates/apply`.
+Administrator only: `GET /updates`, `POST /updates/check`, `POST /updates/apply`,
+and `POST /updates/policy`.
 Bot reads and public API credentials are denied. Check/apply return 202; apply
 requires `expected_version`, `target_version` and `catalog_revision` from GET.
 Stale versions/catalogs, unoffered targets or concurrent switches return 409;
 invalid requests return 400. GET includes `current_version`, `supervisor_version`,
 `repository`, `enabled`, `checking`, check times, `check_error`, `update_available`,
 `latest`, up to two `rollback_versions`, `catalog_revision`, `busy`, `job` and
-download progress. A failed job may report `recovered:true`. Standalone unsupported
+download progress. A failed job may report `recovered:true`.
+Capable supervisors also return `auto_patch_supported:true`, `auto_patch`
+(`enabled`, `revision`, `blocked_versions`), `patch_update` and `job.automatic`.
+The current line's `patch_update` may differ from the overall `latest` feature update.
+POST policy with `{"expected_revision":1,"auto_patch":false}`, using
+`auto_patch.revision`. Success returns 200; a stale policy or active switch returns
+409. Unfinished installations are not retried automatically but may be retried
+manually. Manual rollback persistently disables automatic patches. Missing fields
+identify an older supervisor requiring a base upgrade. Standalone unsupported
 platforms report `enabled:false`. Internal `/_runtime/*` operations are never
 exposed by the supervisor. See [Version manager](UPDATES.md) for release/data rules.

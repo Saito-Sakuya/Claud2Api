@@ -69,43 +69,44 @@ def request(number, path, method="GET", body=None, key=ADMIN, headers=None):
 def build(artifacts):
     target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target")).resolve()
     build_env = dict(os.environ, CARGO_TARGET_DIR=str(target))
-    subprocess.run(["cargo", "build", "--locked", "--offline"], cwd=ROOT, env=build_env, check=True)
-    shutil.copy2(target / "debug/claud2api", artifacts / "base")
-    subprocess.run(["strip", "--strip-debug", str(artifacts / "base")], check=True)
     with tempfile.TemporaryDirectory(prefix="claud2api-versions-") as folder:
         source = Path(folder) / "source"
         shutil.copytree(ROOT, source, ignore=shutil.ignore_patterns(
             ".git", "target", ".local", "__pycache__"))
         toml = (source / "Cargo.toml").read_text()
         lock = (source / "Cargo.lock").read_text()
-        for version in ("9.1.0", "9.2.0", "9.3.0"):
+        html = (source / "ui/index.html").read_text()
+        for version in ("9.1.0", "9.1.1", "9.1.3", "9.2.0"):
             (source / "Cargo.toml").write_text(re.sub(
                 r'(?m)^version = "[^"]+"', 'version = "' + version + '"', toml, count=1))
             (source / "Cargo.lock").write_text(re.sub(
                 r'(name = "claud2api"\nversion = ")[^"]+', r'\g<1>' + version, lock))
             # Embedded panel must represent the built release as well.
-            html = (ROOT / "ui/index.html").read_text()
-            html = re.sub(r'V0\.1alpha1|v0\.1\.0-alpha\.\d+', 'v' + version, html)
-            (source / "ui/index.html").write_text(html)
+            panel = re.sub(r'V0\.1alpha1|v0\.1\.0-alpha\.\d+(?:\.\d+)*',
+                           'v' + version, html, flags=re.IGNORECASE)
+            (source / "ui/index.html").write_text(panel)
             subprocess.run(["cargo", "build", "--locked", "--offline"], cwd=source, env=build_env, check=True)
-            shutil.copy2(target / "debug/claud2api", artifacts / version)
-            subprocess.run(["strip", "--strip-debug", str(artifacts / version)], check=True)
+            output = artifacts / ("base" if version == "9.1.0" else version)
+            shutil.copy2(target / "debug/claud2api", output)
+            subprocess.run(["strip", "--strip-debug", str(output)], check=True)
+            if version == "9.1.0":
+                shutil.copy2(output, artifacts / version)
     # Valid ELF/descriptor, deliberately damages only the isolated fixture DB
     # during worker startup. This exercises restoration, not just an early reject.
     bad = artifacts / "bad.rs"
-    descriptor = json.dumps({"protocol": 1, "version": "v9.4.0", "runtime_abi": ABI,
+    descriptor = json.dumps({"protocol": 1, "version": "v9.1.2", "runtime_abi": ABI,
                              "data_format": FORMAT})
     bad.write_text('fn main() { if std::env::args().any(|a| a == "--describe-build") '
                    '{ println!("{}", r#"' + descriptor + '"#); return; } '
                    'let root=std::env::var("CLAUD2API_DATA_DIR").unwrap(); '
                    'std::fs::write(std::path::Path::new(&root).join("control.sqlite3"), '
                    'b"fixture candidate corruption").unwrap(); std::process::exit(1); }')
-    subprocess.run(["rustc", "--edition", "2024", str(bad), "-o", str(artifacts / "9.4.0")], check=True)
+    subprocess.run(["rustc", "--edition", "2024", str(bad), "-o", str(artifacts / "9.1.2")], check=True)
     (artifacts / "9.5.0").write_bytes(b"bad checksum fixture")
     (artifacts / "9.6.0").write_bytes(b"incompatible manifest fixture")
     (artifacts / "9.7.0").write_bytes(b"unbounded stream fixture")
     for path in artifacts.iterdir():
-        if path.name != "bad.rs":
+        if path.suffix != ".rs":
             path.chmod(0o700)
 
 
@@ -115,6 +116,10 @@ class Fixture:
         self.mode = "normal"
         self.calls = []
         self.github_calls = []
+        self.downloads = []
+        self.release_gate = threading.Event()
+        self.release_gate.set()
+        self.release_entered = threading.Event()
         self.hold = threading.Event()
         self.hold.set()
         self.entered = threading.Event()
@@ -143,6 +148,9 @@ class Fixture:
                     return self.send({"claude_ai_available_models": {"models": [
                         {"model_id": "claude-haiku-5-5"}]}})
                 if path.endswith("/releases"):
+                    fixture.release_entered.set()
+                    if not fixture.release_gate.wait(90):
+                        return self.send({}, 503)
                     fixture.github_calls.append(self.headers.get("If-None-Match"))
                     if fixture.mode == "rate":
                         return self.send({}, 403, {"X-RateLimit-Reset": int(time.time()) + 3600})
@@ -151,8 +159,8 @@ class Fixture:
                     etag = '"fixture-' + fixture.mode + '"'
                     if self.headers.get("If-None-Match") == etag:
                         return self.send(b"", 304)
-                    versions = ["9.3.0", "9.2.0", "9.1.0"]
-                    if fixture.mode != "normal":
+                    versions = fixture.versions()
+                    if fixture.mode in ("9.5.0", "9.6.0", "9.7.0"):
                         versions.insert(0, fixture.mode)
                     return self.send([fixture.release(v) for v in versions], headers={"ETag": etag})
                 if "/releases/tags/" in path:
@@ -165,6 +173,7 @@ class Fixture:
                     return self.send(fixture.manifest(version))
                 if path.startswith("/download/"):
                     version = path.rsplit("/", 1)[1]
+                    fixture.downloads.append(version)
                     raw = (artifacts / version).read_bytes()
                     if version == "9.7.0":
                         self.send_response(200)
@@ -214,8 +223,15 @@ class Fixture:
                            "digest": "sha256:" + ("0" * 64 if version == "9.5.0" and i == 0
                                                    else hashlib.sha256(raw).hexdigest()),
                            "browser_download_url": self.url + "/asset/" + version + "/" + name})
-        return {"id": int(version.split(".")[1]), "tag_name": "v" + version, "draft": False,
+        return {"id": int("".join(re.findall(r"\d+", version))), "tag_name": "v" + version, "draft": False,
                 "prerelease": False, "published_at": "2026-10-18T00:00:00Z", "assets": assets}
+
+    def versions(self):
+        if self.mode == "auto-failure":
+            return ["9.2.0", "9.1.2", "9.1.1", "9.1.0"]
+        if self.mode == "next-patch":
+            return ["9.2.0", "9.1.3", "9.1.1", "9.1.0"]
+        return ["9.2.0", "9.1.3", "9.1.1", "9.1.0"]
 
 
 def acceptance(args):
@@ -224,6 +240,7 @@ def acceptance(args):
     if args.build:
         build(artifacts)
     fixture = Fixture(artifacts)
+    fixture.release_gate.clear()
     with tempfile.TemporaryDirectory(prefix="claud2api-update-state-") as folder:
         data = Path(folder)
         public, control = args.public_port or port(), args.control_port or port()
@@ -240,11 +257,13 @@ def acceptance(args):
             assert status == 200, (path, status, value)
             return value
 
-        def start():
+        def start(wait_initial=True):
             nonlocal process
             process = subprocess.Popen([str(artifacts / "base")], env=env, stdout=log, stderr=log)
             wait(lambda: request(public, "/health")[0] == 200)
-            wait(lambda: api("/updates")["checked_at"] > 0 and not api("/updates")["checking"])
+            wait(lambda: request(control, "/control/v1/updates")[0] == 200)
+            if wait_initial:
+                wait(check_idle)
 
         def stop(hard=False):
             nonlocal process
@@ -252,6 +271,16 @@ def acceptance(args):
                 process.kill() if hard else process.terminate()
                 process.wait(timeout=35)
                 process = None
+
+        def check_idle():
+            state = api("/updates")
+            return state if state["checked_at"] > 0 and not state["checking"] else None
+
+        def change_policy(enabled, revision=None, key=ADMIN):
+            if revision is None:
+                revision = api("/updates")["auto_patch"]["revision"]
+            return request(control, "/control/v1/updates/policy", "POST",
+                           {"expected_revision": revision, "auto_patch": enabled}, key=key)
 
         def apply(version):
             current = api("/updates")
@@ -264,6 +293,21 @@ def acceptance(args):
         def finished(job):
             state = api("/updates")
             return state if state["job"]["id"] == job and not state["busy"] else None
+
+        def version_finished(version):
+            state = api("/updates")
+            return state if state["current_version"] == "v" + version and not state["busy"] else None
+
+        def auto_attempt_finished(version):
+            state = api("/updates")
+            job = state.get("job") or {}
+            if (job.get("target") == "v" + version and job.get("automatic")
+                    and job.get("phase") in ("failed", "completed") and not state["busy"]):
+                return state
+            return None
+
+        def contains_version(values, version):
+            return version in values or "v" + version in values
 
         def messages(history, handle=None, stream=False):
             headers = {"x-c2a-session-id": handle or "update-fixture", "x-api-key": token}
@@ -281,25 +325,34 @@ def acceptance(args):
             assert api("/usage")["requests"] >= 2
 
         try:
-            start()
+            start(wait_initial=False)
+            wait(fixture.release_entered.is_set)
             initial = api("/updates")["current_version"]
+            assert initial == "v9.1.0", initial
             assert api("/updates")["check_interval_seconds"] == 300
             before_checks = len(fixture.github_calls)
             for _ in range(3):
                 api("/updates")
-            assert len(fixture.github_calls) == before_checks
+            assert len(fixture.github_calls) == before_checks, "status polling must not contact the release source"
             for key in (KEY, BOT, "wrong"):
                 assert request(control, "/control/v1/updates", key=key)[0] == 401
+            policy_state = api("/updates")
+            assert policy_state["auto_patch_supported"] is True
+            assert policy_state["auto_patch"]["enabled"] is True, "automatic patching should default on"
+            assert policy_state["auto_patch"]["blocked_versions"] == []
+            initial_policy_revision = policy_state["auto_patch"]["revision"]
+            for key in (KEY, BOT, "wrong"):
+                assert change_policy(False, initial_policy_revision, key=key)[0] == 401
+            status, _, _ = change_policy(False, initial_policy_revision)
+            assert status == 200
+            disabled = api("/updates")["auto_patch"]
+            assert disabled["enabled"] is False and disabled["revision"] > initial_policy_revision
+            status, _, _ = change_policy(True, initial_policy_revision)
+            assert status == 409, "stale policy revision must be rejected"
             assert request(public, "/control/v1/updates")[0] == 404
             assert request(control, "/control/v1/_runtime/export", "POST", {})[0] == 403
             assert request(control, "/control/v1/updates/check", "POST", {}, headers={"Origin": "https://evil.invalid"})[0] == 403
-            state = api("/updates")
-            valid = {"expected_version": state["current_version"], "target_version": "v9.3.0",
-                     "catalog_revision": state["catalog_revision"]}
-            for changed in ({"expected_version": "v0.0.0"}, {"catalog_revision": 999},
-                            {"target_version": "v8.0.0"}):
-                assert request(control, "/control/v1/updates/apply", "POST", dict(valid, **changed))[0] == 409
-            assert request(control, "/control/v1/updates/apply", "POST", dict(valid, extra=True))[0] == 400
+
             revision = api("/settings")["revision"]
             settings = api("/settings")["settings"]
             assert settings["context_budget"] == 128000
@@ -322,34 +375,86 @@ def acceptance(args):
             assert status == 200, result
             handle = headers["x-c2a-session-id"]
             first_call = fixture.calls[-1]
+
+            # Finish the initial catalog check with policy disabled, then verify the setting on restart.
+            fixture.release_gate.set()
+            state = wait(check_idle)
+            assert state["current_version"] == initial
+            assert state["auto_patch"]["enabled"] is False
+            assert state["patch_update"]["version"] == "v9.1.3"
+            assert state["latest"]["version"] == "v9.2.0"
+            stop(hard=True)
+            start()
+            state = api("/updates")
+            assert state["current_version"] == initial
+            assert state["auto_patch"]["enabled"] is False, "policy must persist across restart"
+            preserved()
+            # Legacy bindings are intentionally process-local; establish a fresh baseline after restart.
+            time.sleep(1.1)
+            legacy_payload["messages"] = [{"role": "user", "content": "legacy after policy restart"}]
+            status, _, legacy = request(public, "/v1/chat/completions", "POST", legacy_payload, key=token)
+            assert status == 200, legacy
+            legacy_call = fixture.calls[-1]
+            status, _, _ = change_policy(True, state["auto_patch"]["revision"])
+            assert status == 200
+            state = wait(lambda: version_finished("9.1.3"))
+            assert state["latest"]["version"] == "v9.2.0"
+            assert state["current_version"] == "v9.1.3", "auto-patch must not install the feature release"
+            assert state["auto_patch"]["enabled"] is True
+            assert not contains_version(state["auto_patch"]["blocked_versions"], "9.1.3")
+            assert fixture.downloads.count("9.1.3") == 1
+            preserved()
+            time.sleep(1.1)
+            legacy_payload["messages"] = [{"role": "user", "content": "legacy after automatic patch"}]
+            status, _, legacy = request(public, "/v1/chat/completions", "POST", legacy_payload, key=token)
+            assert status == 200, legacy
+            assert fixture.calls[-1]["id"] == legacy_call["id"], (
+                "automatic patch must preserve legacy conversation binding: "
+                f"expected {(legacy_call['id'], legacy_call['assistant'])}, "
+                f"got {(fixture.calls[-1]['id'], fixture.calls[-1]['parent'])}")
+            assert fixture.calls[-1]["parent"] == legacy_call["assistant"]
+            legacy_call = fixture.calls[-1]
+
+            # A feature release remains manually selectable; updating waits for the active SSE.
+            state = api("/updates")
+            valid = {"expected_version": state["current_version"], "target_version": "v9.2.0",
+                     "catalog_revision": state["catalog_revision"]}
+            for changed in ({"expected_version": "v0.0.0"},
+                            {"catalog_revision": state["catalog_revision"] + 999},
+                            {"target_version": "v8.0.0"}):
+                assert request(control, "/control/v1/updates/apply", "POST", dict(valid, **changed))[0] == 409
+            assert request(control, "/control/v1/updates/apply", "POST", dict(valid, extra=True))[0] == 400
             history += [{"role": "assistant", "content": result["content"]}, {"role": "user", "content": "hold-stream"}]
             time.sleep(1.1)
             fixture.hold.clear()
             with concurrent.futures.ThreadPoolExecutor() as pool:
                 held = pool.submit(messages, history, handle, True)
                 wait(fixture.entered.is_set)
-                job = apply("9.3.0")
+                job = apply("9.2.0")
                 wait(lambda: api("/updates")["job"]["phase"] == "waiting")
                 assert request(control, "/control/v1/updates/apply", "POST", valid)[0] == 409
-                assert api("/updates")["current_version"] == initial
+                assert api("/updates")["current_version"] == "v9.1.3"
                 assert api("/info")["healthy"]
                 assert not held.done(), "active stream was interrupted"
                 fixture.hold.set()
                 status, _, sse = held.result(timeout=20)
                 assert status == 200 and "message_stop" in sse
                 response_times = []
+
                 def probe():
                     while not finished(job):
                         begin = time.monotonic()
                         assert request(public, "/health")[0] == 200
                         response_times.append(time.monotonic() - begin)
                         time.sleep(.03)
+
                 probe_future = pool.submit(probe)
                 state = wait(lambda: finished(job))
                 probe_future.result(timeout=20)
             assert state["job"]["phase"] == "completed", state
-            assert state["current_version"] == "v9.3.0"
-            assert [v["version"] for v in state["rollback_versions"]] == ["v9.2.0", "v9.1.0"]
+            assert state["current_version"] == "v9.2.0"
+            assert state["auto_patch"]["enabled"] is True
+            assert [v["version"] for v in state["rollback_versions"]] == ["v9.1.3", "v9.1.1"]
             preserved()
             time.sleep(1.1)
             history += [{"role": "assistant", "content": "OK"}, {"role": "user", "content": "after update"}]
@@ -366,27 +471,94 @@ def acceptance(args):
             assert fixture.calls[-1]["id"] == legacy_call["id"]
             assert fixture.calls[-1]["parent"] == legacy_call["assistant"]
             legacy_call = fixture.calls[-1]
-            job = apply("9.1.0")
-            assert wait(lambda: finished(job))["job"]["phase"] == "completed"
+
+            # Rolling back through successive releases must turn off patching and stay put after restart.
+            job = apply("9.1.3")
+            state = wait(lambda: finished(job))
+            assert state["job"]["phase"] == "completed"
+            assert state["current_version"] == "v9.1.3"
+            assert state["auto_patch"]["enabled"] is False
             preserved()
             time.sleep(1.1)
             status, _, legacy = request(public, "/v1/chat/completions", "POST", legacy_payload, key=token)
             assert status == 200, legacy
             assert fixture.calls[-1]["id"] == legacy_call["id"]
             assert fixture.calls[-1]["parent"] == legacy_call["assistant"]
+            legacy_call = fixture.calls[-1]
+            job = apply("9.1.1")
+            state = wait(lambda: finished(job))
+            assert state["job"]["phase"] == "completed"
+            assert state["current_version"] == "v9.1.1"
+            assert state["auto_patch"]["enabled"] is False
+            preserved()
+
+            fixture.mode = "normal"
             stop(hard=True)
             start()
-            assert api("/updates")["current_version"] == "v9.1.0", "selected version lost on restart"
+            state = api("/updates")
+            assert state["current_version"] == "v9.1.1", "manual rollback must persist across restart"
+            assert state["auto_patch"]["enabled"] is False
+            assert state["patch_update"]["version"] == "v9.1.3"
+            assert fixture.downloads.count("9.1.3") == 1, "disabled policy must not upgrade after rollback"
             preserved()
-            for bad in ("9.4.0", "9.5.0", "9.6.0", "9.7.0"):
+
+            # The failed patch is blocked across restart; only an administrator's explicit retry can reattempt it.
+            fixture.mode = "auto-failure"
+            stop(hard=True)
+            start()
+            state = api("/updates")
+            assert state["current_version"] == "v9.1.1"
+            assert state["auto_patch"]["enabled"] is False
+            assert state["patch_update"]["version"] == "v9.1.2"
+            status, _, _ = change_policy(True, state["auto_patch"]["revision"])
+            assert status == 200
+            state = wait(lambda: auto_attempt_finished("9.1.2"))
+            assert state["job"]["phase"] == "failed" and state["job"]["automatic"] is True
+            assert state["job"]["recovered"] is True
+            assert contains_version(state["auto_patch"]["blocked_versions"], "9.1.2")
+            assert state["current_version"] == "v9.1.1"
+            assert fixture.downloads.count("9.1.2") == 1
+            failed_auto_job = state["job"]["id"]
+            failed_policy_revision = state["auto_patch"]["revision"]
+            stop(hard=True)
+            start()
+            state = api("/updates")
+            assert state["current_version"] == "v9.1.1"
+            assert contains_version(state["auto_patch"]["blocked_versions"], "9.1.2")
+            assert state["auto_patch"]["revision"] == failed_policy_revision, "restart must not retry the blocked patch"
+            time.sleep(.5)
+            assert api("/updates")["auto_patch"]["revision"] == failed_policy_revision
+            preserved()
+
+            job = apply("9.1.2")
+            state = wait(lambda: finished(job))
+            assert state["job"]["phase"] == "failed" and state["job"]["automatic"] is False
+            assert state["job"]["id"] != failed_auto_job, "manual retry must start a new attempt"
+            assert state["auto_patch"]["revision"] > failed_policy_revision
+            assert fixture.downloads.count("9.1.2") == 1, "verified failed binaries may be retried from cache"
+            assert contains_version(state["auto_patch"]["blocked_versions"], "9.1.2")
+            assert state["current_version"] == "v9.1.1"
+
+            fixture.mode = "next-patch"
+            stop(hard=True)
+            start()
+            state = wait(lambda: version_finished("9.1.3"))
+            assert state["job"]["phase"] == "completed" and state["job"]["automatic"] is True
+            assert state["auto_patch"]["enabled"] is True
+            assert not contains_version(state["auto_patch"]["blocked_versions"], "9.1.2"), (
+                "a successful newer patch should clear versions that are no longer candidates")
+            assert fixture.downloads.count("9.1.3") == 1, "previously verified patch may be reused from cache"
+            preserved()
+
+            for bad in ("9.5.0", "9.6.0", "9.7.0"):
                 stop()
                 fixture.mode = bad
                 start()
                 job = apply(bad)
                 state = wait(lambda: finished(job))
                 assert state["job"]["phase"] == "failed", state
-                assert state["job"]["recovered"] == (bad == "9.4.0"), state
-                assert state["current_version"] == "v9.1.0"
+                assert state["job"]["recovered"] is False, state
+                assert state["current_version"] == "v9.1.3"
                 preserved()
             stop()
             fixture.mode = "rate"
@@ -401,11 +573,17 @@ def acceptance(args):
             stop()
             fixture.mode = "normal"
             start()
-            report = {"passed": True, "initial_version": initial, "current_version": "v9.1.0",
-                      "real_worker_versions": 3, "recovery_from_corrupt_database": True,
+            report = {"passed": True, "initial_version": initial, "current_version": "v9.1.3",
+                      "real_worker_versions": 4, "recovery_from_corrupt_database": True,
                       "rejected_assets": ["checksum", "data format", "oversized stream"],
                       "active_sse_preserved": True, "continuation_and_cache_preserved": True,
                       "legacy_binding_handoff_preserved": True,
+                      "auto_patch_highest_same_line": "v9.1.3",
+                      "feature_release_requires_manual_apply": "v9.2.0",
+                      "policy_default_cas_auth_and_restart_persistence": True,
+                      "blocked_patch_not_retried_and_manual_retry_allowed": "v9.1.2",
+                      "later_patch_after_block": "v9.1.3",
+                      "rollback_disabled_auto_patch_without_reupgrade": "v9.1.1",
                       "peak_health_queue_seconds": max(response_times, default=0),
                       "public_port": public, "control_port": control}
             (artifacts / "report.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -416,6 +594,7 @@ def acceptance(args):
                     time.sleep(1)
         finally:
             fixture.hold.set()
+            fixture.release_gate.set()
             stop()
             fixture.server.shutdown()
             log.close()

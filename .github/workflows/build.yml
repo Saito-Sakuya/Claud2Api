@@ -15,6 +15,15 @@ jobs:
       CARGO_BUILD_JOBS: 4
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+            target
+          key: rust-1-bookworm-e12566d5-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            rust-1-bookworm-e12566d5-${{ runner.os }}-
       - run: apt-get update && apt-get install -y --no-install-recommends cmake perl pkg-config libclang-dev python3 binutils
       - run: rustup component add rustfmt clippy
       - run: cargo fmt --check
@@ -22,7 +31,13 @@ jobs:
       - run: cargo test --locked --all-targets
       - run: python3 scripts/update_acceptance.py --artifacts /tmp/update-acceptance --build
       - run: cargo build --locked --release
+      - name: Package this verified main commit for a possible release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: python3 scripts/package_release.py --binary target/release/claud2api --provenance
       - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         with:
-          name: claud2api-linux-amd64
-          path: target/release/claud2api
+          name: release-assets-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release/*
+          retention-days: 90
+          if-no-files-found: error

@@ -2,7 +2,7 @@
 services:
   claud2api:
     build: .
-    image: "${CLAUD2API_IMAGE:-ghcr.io/saito-sakuya/claud2api:0.1.0-alpha.7}"
+    image: "${CLAUD2API_IMAGE:-ghcr.io/saito-sakuya/claud2api:0.1.0-alpha.6.1}"
     restart: unless-stopped
     network_mode: host
     read_only: true

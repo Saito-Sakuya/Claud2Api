@@ -10,26 +10,134 @@ concurrency:
 jobs:
   package:
     runs-on: ubuntu-latest
-    container: rust:1-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29
-    env:
-      CARGO_BUILD_JOBS: 4
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache@v4
         with:
-          path: |
-            /usr/local/cargo/registry
-            /usr/local/cargo/git
-          key: cargo-downloads-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-      - run: apt-get update && apt-get install -y --no-install-recommends cmake perl pkg-config libclang-dev python3 binutils
-      - run: rustup component add rustfmt clippy
-      - run: cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked --all-targets
-      - run: python3 scripts/update_acceptance.py --artifacts /tmp/update-acceptance --build
-      - run: cargo build --locked --release
-      - name: Prepare verified assets
+          ref: ${{ github.sha }}
+      - name: Wait for the exact trusted main build
+        id: source
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const workflow = await github.rest.actions.getWorkflow({owner, repo, workflow_id: 'build.yml'});
+            const deadline = Date.now() + 30 * 60 * 1000;
+            let minute = 0;
+            while (true) {
+              const response = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: workflow.data.id, head_sha: context.sha, per_page: 100
+              });
+              const runs = response.data.workflow_runs
+                .filter(run => run.workflow_id === workflow.data.id && run.head_sha === context.sha &&
+                  run.event === 'push' && run.head_branch === 'main')
+                .sort((a, b) => b.run_number - a.run_number || b.created_at.localeCompare(a.created_at));
+              const run = runs[0];
+              core.info(`Minute ${minute}: ${run ? `main run ${run.id} attempt ${run.run_attempt} is ${run.status}${run.conclusion ? ` (${run.conclusion})` : ''}` : 'no matching main push run yet'}`);
+              if (run && run.status === 'completed') {
+                if (run.conclusion !== 'success') {
+                  throw new Error(`Trusted main verification failed for ${context.sha}: ${run.html_url} (${run.conclusion})`);
+                }
+                const artifactName = `release-assets-${run.id}-${run.run_attempt}`;
+                const artifacts = await github.rest.actions.listWorkflowRunArtifacts({owner, repo, run_id: run.id, per_page: 100});
+                const artifact = artifacts.data.artifacts.find(item => item.name === artifactName);
+                if (!artifact || artifact.expired || artifact.size_in_bytes <= 0) {
+                  throw new Error(`Successful main run ${run.id} attempt ${run.run_attempt} has no unexpired ${artifactName} artifact`);
+                }
+                const sourceRun = artifact.workflow_run;
+                if (sourceRun && (sourceRun.id !== run.id || sourceRun.head_sha !== context.sha ||
+                    sourceRun.head_branch !== 'main')) {
+                  throw new Error('Artifact run metadata does not match the selected trusted main attempt');
+                }
+                core.setOutput('run_id', String(run.id));
+                core.setOutput('run_attempt', String(run.run_attempt));
+                core.setOutput('artifact_name', artifactName);
+                core.setOutput('run_url', run.html_url);
+                return;
+              }
+              if (Date.now() >= deadline) {
+                throw new Error(`No successful trusted main verification artifact for ${context.sha} within 30 minutes`);
+              }
+              await new Promise(resolve => setTimeout(resolve, Math.min(60_000, deadline - Date.now())));
+              minute += 1;
+            }
+        timeout-minutes: 31
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.source.outputs.artifact_name }}
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: release
+      - name: Verify source provenance and packaged checksums
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: python3 scripts/package_release.py --binary target/release/claud2api --tag "$RELEASE_TAG"
+          EXPECTED_COMMIT: ${{ github.sha }}
+          EXPECTED_TAG: ${{ github.ref_name }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_RUN_ID: ${{ steps.source.outputs.run_id }}
+          EXPECTED_RUN_ATTEMPT: ${{ steps.source.outputs.run_attempt }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          root = Path("release")
+          expected = {
+              "schema": 1,
+              "repository": os.environ["EXPECTED_REPOSITORY"],
+              "commit": os.environ["EXPECTED_COMMIT"],
+              "event": "push",
+              "ref": "refs/heads/main",
+              "run_id": int(os.environ["EXPECTED_RUN_ID"]),
+              "run_attempt": int(os.environ["EXPECTED_RUN_ATTEMPT"]),
+              "tag": os.environ["EXPECTED_TAG"],
+          }
+          provenance = json.loads((root / "build-provenance.json").read_text(encoding="utf-8"))
+          for key, value in expected.items():
+              if provenance.get(key) != value:
+                  raise SystemExit(f"build provenance mismatch for {key}")
+          if provenance.get("workflow") != "Build Claud2Api":
+              raise SystemExit("artifact was not created by the expected verification workflow")
+
+          tag, binary_name = expected["tag"], "claud2api-linux-amd64"
+          manifest = json.loads((root / "claud2api-update.json").read_text(encoding="utf-8"))
+          if manifest.get("version") != tag or manifest.get("binary") != binary_name:
+              raise SystemExit("release tag and update manifest disagree")
+          if not re.fullmatch(r"[0-9a-f]{64}", str(manifest.get("sha256", ""))):
+              raise SystemExit("invalid binary checksum in update manifest")
+
+          listed = {}
+          for line in (root / "SHA256SUMS").read_text(encoding="ascii").splitlines():
+              match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9._-]+)", line)
+              if not match or match.group(2) in listed:
+                  raise SystemExit("invalid SHA256SUMS entry")
+              listed[match.group(2)] = match.group(1)
+          expected_sum_names = {binary_name, "claud2api-update.json", "claud2api-licenses.tar.gz"}
+          if set(listed) != expected_sum_names:
+              raise SystemExit("SHA256SUMS does not contain exactly the three release payloads")
+          asset_names = expected_sum_names | {"SHA256SUMS"}
+          provenance_files = asset_names | {"RELEASE_NOTES.md"}
+          if set(provenance.get("assets", {})) != provenance_files:
+              raise SystemExit("artifact asset provenance is incomplete")
+          for name in provenance_files:
+              digest = hashlib.sha256((root / name).read_bytes()).hexdigest()
+              if provenance["assets"].get(name) != digest:
+                  raise SystemExit(f"artifact provenance checksum mismatch: {name}")
+              if name in listed and listed[name] != digest:
+                  raise SystemExit(f"SHA256SUMS mismatch: {name}")
+          if manifest["sha256"] != hashlib.sha256((root / binary_name).read_bytes()).hexdigest():
+              raise SystemExit("update manifest binary checksum mismatch")
+          if manifest.get("size") != (root / binary_name).stat().st_size:
+              raise SystemExit("update manifest binary size mismatch")
+          print(json.dumps({"commit": expected["commit"], "tag": tag,
+                            "verified_run_id": expected["run_id"],
+                            "verified_run_attempt": expected["run_attempt"],
+                            "assets": sorted(asset_names)}))
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: release-assets
@@ -46,6 +154,8 @@ jobs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
       - uses: actions/download-artifact@v4
         with:
           name: release-assets
@@ -114,7 +224,7 @@ jobs:
                   '\n\nDocker: `' + process.env.RELEASE_IMAGE + '`\n\nDigest: `' + process.env.RELEASE_IMAGE_DIGEST + '`\n\n' +
                   '[发行文件说明 / Release files](https://github.com/' + context.repo.owner + '/' + context.repo.repo + '/blob/' + tag + '/RELEASES_ZH.md)'})).data;
             }
-            // Keep the draft invisible until every asset has its expected digest.
+            // Keep the draft unpublished until every release asset digest matches.
             for (const name of ['claud2api-linux-amd64', 'claud2api-update.json', 'claud2api-licenses.tar.gz', 'SHA256SUMS']) {
               const existing = release.assets.find(asset => asset.name === name);
               if (existing) await github.rest.repos.deleteReleaseAsset({...repo, asset_id: existing.id});

@@ -2,7 +2,7 @@
 
 中文 · [English](DOCS.md)
 
-本文档组对应 **v0.1.0-alpha.7**。每份维护中的项目指南均有完整中英文对应版本。
+本文档组对应 **v0.1.0-alpha.6.1**。每份维护中的项目指南均有完整中英文对应版本。
 原有默认文件名保持有效，可从下表或文档顶部切换语言。
 
 ## 阅读顺序
@@ -16,7 +16,7 @@
 
 | 主题 | 中文 | English | 主要内容 |
 |---|---|---|---|
-| 发行文件 | [发行文件说明](RELEASES_ZH.md) | [Release files](RELEASES.md) | alpha4–alpha7、Docker 镜像及下载文件用途 |
+| 发行文件 | [发行文件说明](RELEASES_ZH.md) | [Release files](RELEASES.md) | alpha4–alpha6.1、Docker 镜像及下载文件用途 |
 | 在线更新 | [版本管理](UPDATES_ZH.md) | [Version manager](UPDATES.md) | 检查新版、一键更新与回退 |
 | 项目入口 | [README](README.md) | [README](README_EN.md) | 安装、控制台使用、API 入口及免责声明 |
 | 开发者文档 | [开发者文档](DEVELOPMENT_ZH.md) | [Developer guide](DEVELOPMENT.md) | 架构、资源与状态归属、扩展、测试及发行 |

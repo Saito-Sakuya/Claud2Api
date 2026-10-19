@@ -2,7 +2,7 @@
 
 [中文](RELEASES_ZH.md) · English · [Documentation index](DOCS.md)
 
-Current version: **v0.1.0-alpha.7**. Linux AMD64 is supported; these are Alpha prereleases.
+Current version: **v0.1.0-alpha.6.1**. Linux AMD64 is supported; these are Alpha prereleases.
 
 ## Versions
 
@@ -11,15 +11,15 @@ Current version: **v0.1.0-alpha.7**. Linux AMD64 is supported; these are Alpha p
 
 - **alpha6**: makes current native tool names explicit, separates client and web tools, and corrects misleading historical claims about unavailable search.
 
-- **alpha7**: restores neutral capability guidance; availability or earlier use does not mandate another call. The model chooses tools for the current task and can answer directly.
+- **alpha6.1**: restores neutral tool guidance, adds automatic patches within the current release line with a panel switch, keeps feature updates manual, and reuses verified main builds for publication.
 
 ## Docker images
 
 ```sh
-docker pull ghcr.io/saito-sakuya/claud2api:0.1.0-alpha.7
+docker pull ghcr.io/saito-sakuya/claud2api:0.1.0-alpha.6.1
 ```
 
-Use `0.1.0-alpha.4` for alpha4, `0.1.0-alpha.5` for alpha5, `0.1.0-alpha.6` for alpha6, or `0.1.0-alpha.7` for alpha7. Matching `v`-prefixed tags are also provided.
+Use `0.1.0-alpha.4` for alpha4, `0.1.0-alpha.5` for alpha5, `0.1.0-alpha.6` for alpha6, or `0.1.0-alpha.6.1` for alpha6.1. Matching `v`-prefixed tags are also provided.
 Pin a specific version and follow [README](README_EN.md) for configuration. The image contains the verified binary from the same Release.
 
 ## Downloads

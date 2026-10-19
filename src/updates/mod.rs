@@ -1,5 +1,6 @@
 mod disk;
 pub mod github;
+mod policy;
 mod supervisor;
 pub mod version;
 

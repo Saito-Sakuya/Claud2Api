@@ -2,11 +2,14 @@
 
 [中文](CHANGELOG.md) · English · [Documentation index](DOCS.md)
 
-## v0.1.0-alpha.7 · 2026-10-19
+## v0.1.0-alpha.6.1 · 2026-10-19
 
+- Install patches in the current release line automatically while retaining confirmation for feature versions; persist the panel switch, stop retrying unfinished patches, and disable automatic patches after manual rollback.
+- Reuse artifacts from the exact commit's fully verified main build instead of repeating tests and compilation for the tag; retain provenance, checksum and final-container checks.
 - Remove alpha6's search-first guidance; describe capabilities and transport without directing the task toward search.
 - Enabled tools or earlier use do not require another call. The model follows the current request and original instructions, and may answer ordinary explanations directly.
 - Add coverage for direct answers with native tools enabled while retaining explicit client tool-policy validation.
+- Older installations need one container/base-supervisor upgrade to enable automatic patches, retaining their state and keys.
 
 ## v0.1.0-alpha.6 · 2026-10-19
 

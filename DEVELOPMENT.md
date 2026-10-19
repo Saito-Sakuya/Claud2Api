@@ -463,12 +463,24 @@ update integration acceptance plus protocol regressions.
 ### Release checks
 
 The backend checks the public GitHub Releases catalog at startup and every 300
-seconds. A connected panel reads update status every 300 seconds and polls progress
+seconds. A connected panel reads backend update status every 30 seconds and polls progress
 while a job is active. All panels share one backend catalog/check budget; opening
 panels does not multiply GitHub polling. Manual checks are throttled to 30 seconds.
 ETags avoid redundant catalog transfers. Network errors, missing releases and rate
 limits leave the service running; retry headers defer checks for 5 minutes to one
 day. No GitHub access token, gateway key or administrator key is sent to GitHub.
+
+Patches in the current release line install automatically by default, for example
+`0.1.0-alpha.6 → 0.1.0-alpha.6.1` or stable `1.2.3 → 1.2.4`. Crossing an
+alpha/beta/rc cycle, stable minor or major version requires confirmation. The
+current line's patch remains discoverable even when a newer feature version exists.
+Publishers must reserve patch identifiers for compatible fixes. Policy and unfinished
+attempts persist in `updates/policy.json`: record before switching, clear on success.
+Failed/interrupted attempts are not retried automatically; newer patches remain
+eligible. Manual rollback persistently disables automatic patches. Administrators
+can change the switch or retry manually. Policy has its own revision counter.
+Successful installation clears obsolete failure records outside the current
+automatic candidate range.
 
 ### Runtime and data continuity
 
@@ -527,6 +539,9 @@ Current protocol is 1, runtime ABI `linux-amd64-glibc-2.36`, data format
 For such changes replace the full container/base executable using a separately
 verified migration and backup plan. The supervisor itself remains at its original
 version; the dialog/API reports both supervisor and running worker versions.
+Automatic patches require a capable supervisor. Older installations must update
+the container/base executable once while preserving their state and keys; hot
+updates to the worker cannot add this capability to an old supervisor.
 
 Selected binaries and the last two installed binaries live under
 `updates/versions/`; selection survives container restart/recreation with the
@@ -539,8 +554,13 @@ Never restore a stale database over accepted requests to perform a normal rollba
 
 ### Build and publish
 
-The release workflow runs formatting, Clippy, tests and isolated update acceptance,
-then builds the pinned Linux runtime and packages its matching version. A pushed
+The main push workflow runs formatting, Clippy, tests and isolated update acceptance,
+then builds and packages the matching Linux binary with checksums and provenance.
+PR artifacts cannot be published. The tag workflow waits up to 30 minutes for a
+successful trusted main run/attempt for the exact commit, verifies the artifact's
+source and every checksum, then builds and tests the final container. It does not
+repeat Rust checks or compilation; without an eligible artifact publication fails.
+A pushed
 tag must be `v` plus the Cargo package version. It creates a draft, uploads the
 binary, manifest and `SHA256SUMS`, verifies GitHub digests, then publishes. A failed
 upload leaves a draft; retrying may replace draft assets, never a published release.
@@ -551,7 +571,7 @@ Local packaging without publication:
 
 ```sh
 cargo build --locked --release
-python3 scripts/package_release.py --binary target/release/claud2api --tag v0.1.0-alpha.4
+python3 scripts/package_release.py --binary target/release/claud2api
 ```
 
 Integration acceptance uses real worker processes, synthetic local releases and

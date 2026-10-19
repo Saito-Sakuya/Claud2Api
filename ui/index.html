@@ -18,7 +18,7 @@
         <span class="brand-name">Claud2Api</span>
       </a>
       <button id="version-entry" class="version-entry" type="button" aria-haspopup="dialog" title="打开版本管理">
-        <span class="version-copy"><span class="version-label">版本管理</span><span id="version-number">v0.1.0-alpha.7</span></span><span class="version-symbol" aria-hidden="true">↻</span>
+        <span class="version-copy"><span class="version-label">版本管理</span><span id="version-number">v0.1.0-alpha.6.1</span></span><span class="version-symbol" aria-hidden="true">↻</span>
       </button>
       <button
         class="collapse-button"
@@ -91,7 +91,7 @@
       </header>
       <main>
         <section id="login" class="login-panel glass">
-          <div class="section-label">Claud2Api · v0.1.0-alpha.7</div>
+          <div class="section-label">Claud2Api · v0.1.0-alpha.6.1</div>
           <h1>登录管理控制台</h1>
           <p>请通过 SSH 隧道访问，并使用独立管理密钥登录。</p>
           <form id="login-form">
@@ -540,10 +540,17 @@
       <div class="panel-heading"><h2 id="version-title">版本管理</h2><button id="version-close" class="quiet" type="button" aria-label="关闭版本管理">关闭</button></div>
       <p id="version-current"></p>
       <p id="version-check-status" role="status"></p>
+      <section id="version-auto-patch" class="version-auto-patch" hidden>
+        <label id="version-auto-patch-toggle" class="version-auto-patch-toggle" hidden>
+          <input id="version-auto-patch-input" type="checkbox" disabled />
+          <span><strong>自动安装补丁</strong><small>默认开启；功能版本仍需确认。失败补丁不会自动重试，可手动更新。</small></span>
+        </label>
+        <p id="version-auto-patch-unsupported" class="muted" hidden>启用自动补丁需先升级守护进程或更新容器。</p>
+      </section>
       <div id="version-options" class="version-options"></div>
       <p id="version-draft-note" class="version-warning" hidden>请先保存或关闭未完成的编辑，并保存刚创建的令牌。</p>
       <div id="version-job" class="version-job" hidden><strong id="version-job-label"></strong><progress id="version-progress" max="1" value="0"></progress><p id="version-job-detail"></p></div>
-      <p class="muted">更新与回退均保留现有数据，等待当前请求结束后切换。完成后面板自动重新载入。</p>
+      <p class="muted">保留现有数据，等待当前请求结束后切换并重新载入面板。回退会暂停自动补丁。</p>
       <div class="form-actions"><button id="version-apply" type="button" disabled>选择目标版本</button><button id="version-check" class="quiet" type="button">检查更新</button><button id="version-reload" class="quiet" type="button" hidden>重新载入面板</button></div>
     </dialog>
     <script defer src="/versions.js"></script>

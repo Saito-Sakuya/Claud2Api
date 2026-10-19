@@ -227,6 +227,13 @@ small {
 }
 .version-dialog::backdrop { background: #0009; backdrop-filter: blur(5px); }
 .version-dialog p { margin-bottom: 14px; }
+.version-auto-patch { margin: 14px 0 18px; padding: 14px; border: 1px solid var(--line); border-radius: 9px; background: #88d8bc08; }
+.version-auto-patch-toggle { display: flex; align-items: flex-start; gap: 12px; cursor: pointer; }
+.version-auto-patch-toggle input { width: 20px; height: 20px; flex: none; margin: 1px 0 0; accent-color: var(--accent); }
+.version-auto-patch-toggle > span { display: grid; gap: 5px; min-width: 0; }
+.version-auto-patch-toggle strong { color: var(--text); font-size: 14px; }
+.version-auto-patch-toggle small { color: var(--muted); line-height: 1.5; }
+.version-auto-patch #version-auto-patch-unsupported { margin: 0; }
 .version-options { display: grid; gap: 10px; }
 .version-choice { display: flex; gap: 12px; align-items: center; padding: 13px; margin: 0; border: 1px solid var(--line); border-radius: 9px; cursor: pointer; }
 .version-choice input { width: 20px; height: 20px; flex: none; accent-color: var(--accent); }

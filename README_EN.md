@@ -4,7 +4,7 @@
 
 <h1 align="center">Claud2Api</h1>
 
-<p align="center"><strong>v0.1.0-alpha.7</strong></p>
+<p align="center"><strong>v0.1.0-alpha.6.1</strong></p>
 
 <p align="center">
   <a href="DEPLOY_EN.md"><img src="docs/badges/linux-amd64.svg" alt="Supported platform: Linux AMD64" height="26" /></a>
@@ -94,10 +94,10 @@ Open `http://127.0.0.1:18082/` and sign in with the separate key in `admin-key.t
   hour after the last successful request.
 - **Runtime settings:** change session/request/scheduling limits and toggle each
   native web-tool group. Simulated one-hour cache display is enabled by default.
-- **Version manager:** check at startup and every five minutes, with an amber glow
-  for updates. Upgrade compatible versions or roll back to the two preceding
-  published releases while retaining data, then reload the panel automatically.
-  A first release without history has no rollback choices.
+- **Version manager:** check at startup and every five minutes. Patches within the
+  current release line install automatically; feature updates glow amber and need
+  confirmation. Keep data and reload the panel automatically, with rollback to the
+  two preceding published versions. Rollback disables automatic patches.
 - **Message logs:** compact two-line input/output and simulated cache read/write
   (`1h`) counts; ordinary input excludes cache, and hover reveals exact values.
   Show upstream/downstream JSON/SSE status and token names. Filter
