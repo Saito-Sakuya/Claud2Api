@@ -2,7 +2,7 @@
 
 中文 · [English](RELEASES.md) · [文档索引](DOCS_ZH.md)
 
-当前版本：**v0.1.0-alpha.4**。支持 Linux AMD64；以下版本均为 Alpha 预发行版。
+当前版本：**v0.1.0-alpha.5**。支持 Linux AMD64；以下版本均为 Alpha 预发行版。
 
 ## 版本区别
 
@@ -12,7 +12,7 @@
 ## Docker 镜像
 
 ```sh
-docker pull ghcr.io/saito-sakuya/claud2api:0.1.0-alpha.4
+docker pull ghcr.io/saito-sakuya/claud2api:0.1.0-alpha.5
 ```
 
 alpha4 的固定标签为 `0.1.0-alpha.4`，alpha5 为 `0.1.0-alpha.5`，也接受相同版本的 `v` 前缀标签。

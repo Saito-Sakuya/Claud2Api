@@ -258,6 +258,11 @@ const settingFields = {
   request_timeout_seconds: ["请求超时", 1, 900, "秒 · 包含等待与迁移"],
   max_request_bytes: ["请求大小上限", 1024, 33554432, "字节"],
   simulated_cache: ["模拟 1h 缓存", null, null, "本地估算展示，默认开启"],
+  native_web_search: ["网页搜索与读取", null, null, "Claude 原生联网工具"],
+  native_repl: ["代码执行与文件", null, null, "在 Claude 远端沙箱运行"],
+  native_artifacts: ["Artifacts", null, null, "保留作品内容与链接"],
+  native_widgets: ["图表与信息卡片", null, null, "保留网页工具的结构化结果"],
+  native_project_knowledge: ["项目知识检索", null, null, "仅在请求指定 Claude Project 时启用"],
   compaction_enabled: ["自动压缩上下文", null, null, "保留最近完整交互"],
   context_budget: ["上下文估算预算", 4096, 1000000, "本地估算单位"],
   compaction_trigger_percent: ["压缩触发比例", 10, 90, "%"],
@@ -546,6 +551,8 @@ function renderLogs(data, append = false) {
     organizations: "组织信息",
     model_catalog: "模型目录",
     conversation_create: "创建会话",
+    native_file_download: "下载生成文件",
+    project_bind: "绑定项目",
     conversation_delete: "清理会话",
   };
   table(

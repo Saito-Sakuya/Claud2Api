@@ -2,7 +2,7 @@
 
 [中文](RELEASES_ZH.md) · English · [Documentation index](DOCS.md)
 
-Current version: **v0.1.0-alpha.4**. Linux AMD64 is supported; these are Alpha prereleases.
+Current version: **v0.1.0-alpha.5**. Linux AMD64 is supported; these are Alpha prereleases.
 
 ## Versions
 
@@ -12,7 +12,7 @@ Current version: **v0.1.0-alpha.4**. Linux AMD64 is supported; these are Alpha p
 ## Docker images
 
 ```sh
-docker pull ghcr.io/saito-sakuya/claud2api:0.1.0-alpha.4
+docker pull ghcr.io/saito-sakuya/claud2api:0.1.0-alpha.5
 ```
 
 Use `0.1.0-alpha.4` for alpha4 or `0.1.0-alpha.5` for alpha5. Matching `v`-prefixed tags are also provided.

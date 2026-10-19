@@ -10,15 +10,15 @@ guide explains ownership, invariants and how to change the implementation safely
 ## 1. Scope and current boundaries
 
 Claud2Api is a Rust HTTP service with an embedded administration console. Its
-primary interface is an Anthropic-shaped Messages text/client-tool bridge. The
-upstream is a web conversation service, so an accepted API field does not imply
-the corresponding native API capability.
+primary interface is an Anthropic-shaped Messages text/client-tool bridge with
+native web-tool extensions. The upstream is a web conversation service, so an
+accepted API field does not imply the corresponding native API capability.
 
-- Messages supports JSON/SSE, validated client tools, durable sticky sessions,
-  quota-aware migration and local context compaction.
-- Chat Completions and Responses retain separate **text compatibility** paths.
-  They do not implement the complete OpenAI protocols or inherit all Messages
-  session/compaction/migration behavior.
+- Messages supports JSON/SSE, validated client tools, native web-tool extensions,
+  durable sticky sessions, quota-aware migration and local context compaction.
+- Chat Completions and Responses retain separate text-input compatibility paths
+  with native web-tool extensions. They do not implement the complete OpenAI
+  protocols or inherit all Messages session/compaction/migration behavior.
 - Models come from the selected account's catalog. New native IDs do not require
   a hardcoded model-family allowlist. An unknown price does not block generation.
 - Token counts, one-hour cache metrics and USD costs are local estimates.
@@ -38,6 +38,9 @@ the corresponding native API capability.
 | [src/config.rs](src/config.rs) | Startup configuration, credentials and validated runtime settings |
 | [src/web.rs](src/web.rs) | Public authentication, response lifetime, Messages JSON/SSE |
 | [src/protocol.rs](src/protocol.rs) | Input projection, transcript/tool validation, identities and tool-frame decoding |
+| [src/native_tools.rs](src/native_tools.rs) | Native web tool groups, settings and descriptors |
+| [src/native_stream.rs](src/native_stream.rs) | Native tool lifecycles, structured results and citations |
+| [src/native_files.rs](src/native_files.rs) | Expiring generated-file downloads scoped to the API token |
 | [src/models.rs](src/models.rs) | Published model IDs, exact aliases and native resolution |
 | [src/tokens.rs](src/tokens.rs) | Managed credentials, digests and token admission |
 | [src/guard.rs](src/guard.rs) | Request cancellation/deadlines, account pool and single-account leases |
@@ -238,6 +241,11 @@ Never put credentials, prompts, tool arguments/results or summary text into thos
 metadata rows. The encrypted snapshot does contain account credentials, proxy
 secrets and bounded handoff summaries, so backups remain sensitive.
 
+The five native-tool switches live in the additive `native_tool_settings` table,
+not in the snapshot fields older alpha4 builds cannot parse. This keeps the
+encrypted snapshot readable for compatible rollback. Missing saved switch values
+default to enabled; new values commit with the snapshot in one SQLite transaction.
+
 On Linux, protect the state directory with 0700 and database/lock files with
 0600. The store uses an exclusive instance lock and SQLite WAL/FULL settings.
 Back up the whole state directory with the matching gateway key while stopped.
@@ -264,11 +272,21 @@ local. Fetching records an observation without changing mappings or their
 revision; the UI merges missing entries into an unsaved draft. Saving is separate.
 
 Client tools are encoded in a nonce-delimited text protocol and validated against
-the declared schemas. Native upstream tools are disabled on the Messages bridge.
-The gateway executes no tools and fabricates no results. Ignore unsupported
-optional controls only at their declared boundary: a `thinking` key inside tool
-input is business data. Do not recursively strip it. Remote/file schema loading
-is disabled. New block types need explicit protocol support, not a generic cast.
+the declared schemas. Messages can also enable web search/fetch, remote Artifacts,
+remote code/file tools, all 37 current web information/interaction widgets and
+bound-project knowledge search through administrator settings and per-request
+selection. Project search requires a canonical UUID; never enumerate private
+projects from an account. Native tools run in Claude's remote environment; the
+gateway never runs commands locally or fabricates results.
+`claud2api_native` blocks must pass protocol validation and round-trip unchanged
+in complete history; each native call/result pair stays within one assistant turn.
+Settings, project UUID and request selection participate in the session
+fingerprint, and internal summaries keep native tools off. Generated files use an
+encrypted, token-owner-bound download handle; cap downloads at 32 MiB and retain
+the originating web conversation until handle expiry. Ignore unsupported optional controls
+only at their declared boundary: a `thinking` key inside tool input is business
+data. Do not recursively strip it. Remote/file schema loading is disabled. New
+block types need explicit protocol support, not a generic cast.
 
 Profiles are the exact supported `wreq`/`wreq-util` bundles: Chrome Windows 146–152
 and Firefox Windows 144–151. A profile change requires an idle account and preserves

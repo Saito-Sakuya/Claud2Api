@@ -89,6 +89,11 @@ value fails startup. Corresponding settings can be changed through the console.
 | `CONTEXT_BUDGET_TOKENS` | 128000 | 4096–1000000 conservative local budget units |
 | `CONTEXT_COMPACTION_TRIGGER_PERCENT` | 75 | 10–90 |
 | `CONTEXT_KEEP_RECENT_ROUNDS` | 6 | 1–32 complete text/tool units |
+| `NATIVE_WEB_SEARCH_ENABLED` | true | Enable the web search/fetch group |
+| `NATIVE_ARTIFACTS_ENABLED` | true | Enable the Artifacts group |
+| `NATIVE_REPL_ENABLED` | true | Enable remote code/file tools |
+| `NATIVE_WIDGETS_ENABLED` | true | Enable 37 Claude web information/interaction widgets |
+| `NATIVE_PROJECT_KNOWLEDGE_ENABLED` | true | Allow bound-project search; requests still need a project UUID |
 | `ACCOUNT_MIN_INTERVAL_SECONDS` | 5 | 1–300 seconds |
 | `ACCOUNT_REQUESTS_PER_MINUTE` | 6 | 1–60 starts per rolling minute |
 | `ACCOUNT_RATE_LIMIT_COOLDOWN_SECONDS` | 60 | 60–86400 seconds; minimum quota cooldown |
@@ -112,7 +117,16 @@ services:
     environment:
       BROWSER_PROFILE: firefox_151_windows
       ACCOUNT_RATE_LIMIT_FALLBACK_SECONDS: "18000"
+      NATIVE_WEB_SEARCH_ENABLED: "true"
+      NATIVE_ARTIFACTS_ENABLED: "true"
+      NATIVE_REPL_ENABLED: "true"
+      NATIVE_WIDGETS_ENABLED: "true"
+      NATIVE_PROJECT_KNOWLEDGE_ENABLED: "true"
 ```
+
+The console can also toggle each native-tool group. Compose does not pass these
+environment variables by default. They seed new state; saved runtime settings
+take precedence.
 
 Start with the override loaded explicitly:
 

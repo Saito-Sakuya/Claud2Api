@@ -321,6 +321,10 @@ pub fn operation(path: &str, method: &str) -> &'static str {
         "organizations"
     } else if path.starts_with("/edge-api/") {
         "model_catalog"
+    } else if path.contains("/wiggle/download-file?") {
+        "native_file_download"
+    } else if method == "PUT" && path.ends_with("?rendering_mode=raw") {
+        "project_bind"
     } else if method == "DELETE" {
         "conversation_delete"
     } else {

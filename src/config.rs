@@ -8,6 +8,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const fn enabled_by_default() -> bool {
+    true
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -24,6 +28,16 @@ pub struct Settings {
     pub rate_limit_min_seconds: u64,
     pub rate_limit_fallback_seconds: u64,
     pub overload_seconds: u64,
+    #[serde(default = "enabled_by_default")]
+    pub native_web_search: bool,
+    #[serde(default = "enabled_by_default")]
+    pub native_artifacts: bool,
+    #[serde(default = "enabled_by_default")]
+    pub native_repl: bool,
+    #[serde(default = "enabled_by_default")]
+    pub native_widgets: bool,
+    #[serde(default = "enabled_by_default")]
+    pub native_project_knowledge: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -41,6 +55,11 @@ impl Default for Settings {
             rate_limit_min_seconds: 60,
             rate_limit_fallback_seconds: 18000,
             overload_seconds: 15,
+            native_web_search: true,
+            native_artifacts: true,
+            native_repl: true,
+            native_widgets: true,
+            native_project_knowledge: true,
         }
     }
 }
@@ -99,6 +118,11 @@ impl Settings {
         number!(overload_seconds, "ACCOUNT_OVERLOAD_COOLDOWN_SECONDS");
         number!(simulated_cache, "SIMULATED_CACHE_ENABLED");
         number!(compaction_enabled, "CONTEXT_COMPACTION_ENABLED");
+        number!(native_web_search, "NATIVE_WEB_SEARCH_ENABLED");
+        number!(native_artifacts, "NATIVE_ARTIFACTS_ENABLED");
+        number!(native_repl, "NATIVE_REPL_ENABLED");
+        number!(native_widgets, "NATIVE_WIDGETS_ENABLED");
+        number!(native_project_knowledge, "NATIVE_PROJECT_KNOWLEDGE_ENABLED");
         s.validate()?;
         Ok(s)
     }

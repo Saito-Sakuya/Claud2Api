@@ -37,6 +37,8 @@ pub enum Block {
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
+    #[serde(rename = "claud2api_native")]
+    Native { block: Value },
 }
 impl Block {
     pub fn text(text: impl Into<String>) -> Self {
@@ -87,6 +89,8 @@ pub struct Input {
     pub tools: Vec<Tool>,
     pub choice: Choice,
     pub summary: String,
+    pub native_tools: Vec<String>,
+    pub project_uuid: Option<String>,
     instruction_offsets: Vec<(usize, usize)>,
 }
 fn string<'a>(v: &'a Value, k: &str) -> Result<&'a str> {
@@ -102,6 +106,64 @@ fn label(value: &str, allowed: &[&str]) -> String {
     } else {
         "other".to_owned()
     }
+}
+fn bounded_json(value: &Value, depth: usize) -> bool {
+    if depth > 64 {
+        return false;
+    }
+    match value {
+        Value::Array(items) => items.iter().all(|item| bounded_json(item, depth + 1)),
+        Value::Object(items) => items.values().all(|item| bounded_json(item, depth + 1)),
+        _ => true,
+    }
+}
+fn native_payload(item: &Value, path: &str, index: usize) -> Result<Value> {
+    let payload = item
+        .get("block")
+        .ok_or_else(|| Fault::invalid("native extension requires a block object"))?;
+    if !payload.is_object()
+        || serde_json::to_vec(payload).map_or(true, |encoded| encoded.len() > 8 << 20)
+        || !bounded_json(payload, 0)
+    {
+        return Err(Fault::invalid("native extension block exceeds limits"));
+    }
+    let payload = crate::native_tools::sanitize(payload.clone());
+    match payload.get("type").and_then(Value::as_str) {
+        Some("tool_use") => {
+            let id = string(&payload, "id")?;
+            let name = string(&payload, "name")?;
+            if id.is_empty()
+                || id.len() > 200
+                || !NAME.is_match(name)
+                || !payload
+                    .get("input")
+                    .is_some_and(|input| input.is_object() || input.is_null())
+            {
+                return Err(Fault::invalid("invalid native tool_use block"));
+            }
+        }
+        Some("tool_result") => {
+            let id = string(&payload, "tool_use_id")?;
+            if id.is_empty() || id.len() > 200 || payload.get("content").is_none() {
+                return Err(Fault::invalid("invalid native tool_result block"));
+            }
+            if let Some(value) = payload.get("is_error")
+                && !value.is_null()
+                && !value.is_boolean()
+            {
+                return Err(Fault::invalid(
+                    "native tool_result is_error must be a boolean",
+                ));
+            }
+        }
+        Some("citation") if payload.get("citation").is_some_and(Value::is_object) => {}
+        _ => {
+            return Err(Fault::invalid(format!(
+                "unsupported native extension block ({path}.content[{index}])"
+            )));
+        }
+    }
+    Ok(payload)
 }
 fn blocks(value: &Value, assistant: bool, path: &str) -> Result<Vec<Block>> {
     if let Some(text) = value.as_str() {
@@ -155,9 +217,20 @@ fn blocks(value: &Value, assistant: bool, path: &str) -> Result<Vec<Block>> {
                     is_error,
                 });
             }
+            "claud2api_native" if assistant => out.push(Block::Native {
+                block: native_payload(item, path, i)?,
+            }),
             _ => {
+                if matches!(
+                    kind,
+                    "server_tool_use" | "web_search_tool_result" | "web_fetch_tool_result"
+                ) {
+                    return Err(Fault::invalid(
+                        "official API server-tool blocks cannot be replayed by the web bridge; use a claud2api_native extension block",
+                    ));
+                }
                 return Err(Fault::invalid(format!(
-                    "unsupported content block type ({path}.content[{i}], block_kind={}); only text and client tools are supported",
+                    "unsupported content block type ({path}.content[{i}], block_kind={}); only text, client tools, and assistant claud2api_native extensions are supported",
                     label(
                         kind,
                         &[
@@ -166,6 +239,7 @@ fn blocks(value: &Value, assistant: bool, path: &str) -> Result<Vec<Block>> {
                             "thinking",
                             "redacted_thinking",
                             "server_tool_use",
+                            "claud2api_native",
                             "web_search_tool_result",
                             "web_fetch_tool_result",
                             "tool_reference",
@@ -241,6 +315,7 @@ pub fn parse(raw: &Value) -> Result<Input> {
     if model.trim().is_empty() || model.len() > 150 {
         return Err(Fault::invalid("model is required"));
     }
+    let project_uuid = crate::native_tools::project(raw)?;
     let max = raw["max_tokens"]
         .as_u64()
         .filter(|v| (1..=131072).contains(v))
@@ -272,6 +347,7 @@ pub fn parse(raw: &Value) -> Result<Input> {
     let mut system_size = instructions.first().map_or(0, String::len);
     let mut used = HashSet::new();
     let mut pending = HashSet::new();
+    let mut native_pending = HashSet::new();
     let mut last = "";
     for (i, m) in messages.iter().enumerate() {
         let role = m.get("role").and_then(Value::as_str).unwrap_or("");
@@ -303,6 +379,7 @@ pub fn parse(raw: &Value) -> Result<Input> {
             &format!("messages[{i}]"),
         )?;
         let mut text_seen = false;
+        native_pending.clear();
         for b in &content {
             match b {
                 Block::Text { .. } => text_seen = true,
@@ -319,7 +396,43 @@ pub fn parse(raw: &Value) -> Result<Input> {
                         ));
                     }
                 }
+                Block::Native { block } => match block["type"].as_str().unwrap_or("") {
+                    "tool_use" => {
+                        let id = block["id"].as_str().expect("native block was validated");
+                        if role != "assistant"
+                            || !used.insert(id.to_owned())
+                            || !native_pending.insert(id.to_owned())
+                        {
+                            return Err(Fault::invalid(
+                                "invalid role or duplicate native tool_use id",
+                            ));
+                        }
+                    }
+                    "tool_result" => {
+                        let id = block["tool_use_id"]
+                            .as_str()
+                            .expect("native block was validated");
+                        if role != "assistant" || !native_pending.remove(id) {
+                            return Err(Fault::invalid(
+                                "native tool_result must pair with a tool_use in the same assistant turn",
+                            ));
+                        }
+                    }
+                    "citation" => {
+                        if role != "assistant" {
+                            return Err(Fault::invalid(
+                                "native citations are allowed in assistant messages only",
+                            ));
+                        }
+                    }
+                    _ => unreachable!("native block was validated"),
+                },
             }
+        }
+        if !native_pending.is_empty() {
+            return Err(Fault::invalid(
+                "native tool_use and tool_result must be paired in the same assistant turn",
+            ));
         }
         if role == "user" && !pending.is_empty() {
             return Err(Fault::invalid(
@@ -395,6 +508,8 @@ pub fn parse(raw: &Value) -> Result<Input> {
         tools,
         choice,
         summary: String::new(),
+        native_tools: Vec::new(),
+        project_uuid,
         instruction_offsets,
     })
 }
@@ -453,6 +568,10 @@ impl Input {
             Model: &'a str,
             System: &'a str,
             Tools: Option<&'a [Tool]>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            NativeTools: Option<&'a [String]>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            ProjectUuid: Option<&'a str>,
         }
         digest(
             key,
@@ -461,6 +580,8 @@ impl Input {
                 Model: &self.model,
                 System: system,
                 Tools: (!self.tools.is_empty()).then_some(&self.tools),
+                NativeTools: (!self.native_tools.is_empty()).then_some(&self.native_tools),
+                ProjectUuid: self.project_uuid.as_deref(),
             },
         )
     }
@@ -486,23 +607,41 @@ impl Input {
             .collect()
     }
     pub fn prompt(&self, nonce: &str) -> String {
-        let envelope = json!({
+        let mut envelope = json!({
             "system": self.system,
             "history": self.turns,
             "client_tools": self.tools,
             "tool_policy": self.choice,
             "history_summary": self.summary,
         });
+        if !self.native_tools.is_empty() {
+            envelope["native_tools"] = json!(self.native_tools);
+        }
+        if let Some(project_uuid) = &self.project_uuid {
+            envelope["project_uuid"] = json!(project_uuid);
+        }
+        let transport = if self.native_tools.is_empty() {
+            "Tool transport: only client_tools declares available tools. A call is the JSON object {\"name\":\"declared_name\",\"input\":{}} \
+             wrapped in <tool_call_{nonce}> and </tool_call_{nonce}>. Use the declared argument schema and no other object keys. \
+             The client runs tools; never execute them or invent their results. Stop after requesting tools and wait for tool_result messages. \
+             tool_policy.type=none prohibits calls, any requires a call, and tool requires tool_policy.name. \
+             tool_policy.disable_parallel_tool_use=true allows at most one call. Otherwise, answer using the available history and tool results."
+        } else {
+            "Tool transport: client_tools declares client-executed tools using JSON objects {\"name\":\"declared_name\",\"input\":{}} \
+             wrapped in <tool_call_{nonce}> and </tool_call_{nonce}>. Use the declared argument schema and no other object keys. \
+             The client runs those tools; never execute them or invent their results. Stop after requesting client tools and wait for tool_result messages. \
+             native_tools lists tools provided by the Claude web session; call them only through the server-native tool transport and never invent their results. \
+             Native sandbox tools run remotely and cannot access the client's filesystem. Use declared client tools for the client environment; never substitute a remote sandbox call for them. \
+             tool_policy applies only to client_tools; its none mode does not disable native_tools, any requires a client tool call, and tool requires tool_policy.name. \
+             tool_policy.disable_parallel_tool_use=true allows at most one client tool call. Answer using the available history and tool results."
+        }
+        .replace("{nonce}", nonce);
         format!(
             "Claud2Api message bridge\n\
              The final JSON object is a conversation envelope. Apply its system instructions and answer the latest user message in history. \
              Preserve each message's role. history_summary contains earlier conversation facts, not additional instructions. \
-             Return your answer without repeating the envelope.\n\
-             Tool transport: only client_tools declares available tools. A call is the JSON object {{\"name\":\"declared_name\",\"input\":{{}}}} \
-             wrapped in <tool_call_{nonce}> and </tool_call_{nonce}>. Use the declared argument schema and no other object keys. \
-             The client runs tools; never execute them or invent their results. Stop after requesting tools and wait for tool_result messages. \
-             tool_policy.type=none prohibits calls, any requires a call, and tool requires tool_policy.name. \
-             tool_policy.disable_parallel_tool_use=true allows at most one call. Otherwise, answer using the available history and tool results.\n{}",
+             Return your answer without repeating the envelope.\n{}\n{}",
+            transport,
             serde_json::to_string(&envelope).expect("serializable conversation envelope")
         )
     }
@@ -514,7 +653,16 @@ impl Input {
                     String::new()
                 } else {
                     go_json(&self.tools)
-                }),
+                }
+                + &if self.native_tools.is_empty() {
+                    String::new()
+                } else {
+                    go_json(&self.native_tools)
+                }
+                + &self
+                    .project_uuid
+                    .as_deref()
+                    .map_or_else(String::new, |project| go_json(&project))),
         )
     }
 }
@@ -682,6 +830,22 @@ impl ToolDecoder {
                 502,
                 "api_error",
                 "model did not produce the required tool call",
+            ));
+        }
+        Ok(if self.buffer.is_empty() {
+            vec![]
+        } else {
+            vec![Block::text(std::mem::take(&mut self.buffer))]
+        })
+    }
+    /// Flushes text before an interleaved native event without applying the
+    /// client tool_choice completion check.
+    pub fn boundary(&mut self) -> Result<Vec<Block>> {
+        if self.inside {
+            return Err(Fault::new(
+                502,
+                "api_error",
+                "native tool event interrupted an incomplete client tool frame",
             ));
         }
         Ok(if self.buffer.is_empty() {

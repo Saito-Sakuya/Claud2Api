@@ -116,7 +116,12 @@ not a partial patch. This example contains the defaults:
     "account_requests_per_minute": 6,
     "rate_limit_min_seconds": 60,
     "rate_limit_fallback_seconds": 18000,
-    "overload_seconds": 15
+    "overload_seconds": 15,
+    "native_web_search": true,
+    "native_artifacts": true,
+    "native_repl": true,
+    "native_widgets": true,
+    "native_project_knowledge": true
   }
 }
 ```
@@ -126,6 +131,11 @@ Unknown settings fields are rejected. Edits affect new requests; in-flight reque
 retain their captured limits. Saved values survive restart. The sample revision
 is illustrative: use the current GET value and review existing settings before
 replacing them.
+The five `native_*` switches default to enabled and can be changed separately in
+the settings page. Older state files that omit them migrate with all five enabled.
+Requests may select a subset with `claud2api_tools`, but cannot override a group
+disabled by the administrator. Project knowledge also requires the request's
+`claud2api_project_uuid`; without one it is not added to the default groups.
 
 ## Model configuration
 

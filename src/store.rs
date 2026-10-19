@@ -145,6 +145,69 @@ pub struct Snapshot {
     pub pending: Vec<Cleanup>,
     pub imported_v1: bool,
 }
+
+// Keep these settings outside the encrypted snapshot until older alpha4 builds
+// no longer need to open it. Their Settings type rejects unknown JSON fields.
+const fn default_native_tool_enabled() -> bool {
+    true
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeToolSettings {
+    native_web_search: bool,
+    native_artifacts: bool,
+    native_repl: bool,
+    native_widgets: bool,
+    #[serde(default = "default_native_tool_enabled")]
+    native_project_knowledge: bool,
+}
+impl From<&Settings> for NativeToolSettings {
+    fn from(settings: &Settings) -> Self {
+        Self {
+            native_web_search: settings.native_web_search,
+            native_artifacts: settings.native_artifacts,
+            native_repl: settings.native_repl,
+            native_widgets: settings.native_widgets,
+            native_project_knowledge: settings.native_project_knowledge,
+        }
+    }
+}
+impl NativeToolSettings {
+    fn apply(self, settings: &mut Settings) {
+        settings.native_web_search = self.native_web_search;
+        settings.native_artifacts = self.native_artifacts;
+        settings.native_repl = self.native_repl;
+        settings.native_widgets = self.native_widgets;
+        settings.native_project_knowledge = self.native_project_knowledge;
+    }
+}
+
+fn storage_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>> {
+    let mut value = serde_json::to_value(snapshot).map_err(|_| Fault::internal())?;
+    let settings = value
+        .get_mut("settings")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(Fault::internal)?;
+    for field in [
+        "native_web_search",
+        "native_artifacts",
+        "native_repl",
+        "native_widgets",
+        "native_project_knowledge",
+    ] {
+        settings.remove(field);
+    }
+    serde_json::to_vec(&value).map_err(|_| Fault::internal())
+}
+
+fn parse_native_tool_settings(payload: &str) -> Result<NativeToolSettings> {
+    if payload.is_empty() || payload.len() > 1024 {
+        return Err(Fault::internal());
+    }
+    serde_json::from_str(payload).map_err(|_| Fault::internal())
+}
+
 impl Snapshot {
     pub fn queue(&mut self, account: &str, conversation: &str) {
         if !conversation.is_empty()
@@ -289,6 +352,7 @@ impl Store {
         }
         for sql in [
             "CREATE TABLE IF NOT EXISTS vault (id INTEGER PRIMARY KEY CHECK(id=1), payload BLOB NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS native_tool_settings (id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS usage (seq INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, data TEXT NOT NULL)",
             "CREATE INDEX IF NOT EXISTS usage_at ON usage(at)",
@@ -356,6 +420,14 @@ impl Store {
                 imported_v1: false,
             }
         };
+        if let Some(payload) =
+            sqlx::query_scalar::<_, String>("SELECT payload FROM native_tool_settings WHERE id=1")
+                .fetch_optional(&db)
+                .await
+                .map_err(|_| Fault::internal())?
+        {
+            parse_native_tool_settings(&payload)?.apply(&mut state.settings);
+        }
         state.settings.validate()?;
         state.models.validate()?;
         if let Some(catalog) = &state.upstream_catalog {
@@ -541,17 +613,25 @@ impl Store {
         if next.sessions.len() > 512 || next.pending.len() > 65536 {
             return Err(Fault::busy("session state capacity reached", 15));
         }
-        let plain = serde_json::to_vec(&next).map_err(|_| Fault::internal())?;
-        if plain.len() > 16 << 20 {
+        let full_state = serde_json::to_vec(&next).map_err(|_| Fault::internal())?;
+        if full_state.len() > 16 << 20 {
             return Err(Fault::internal());
         }
         // Active tickets are intentionally runtime-only. Empty sweeps and runtime
         // ownership changes must not encrypt/fsync an unchanged durable snapshot.
         // Named events still commit even when their state happens to be unchanged.
-        if kind.is_empty() && plain == serde_json::to_vec(&*guard).map_err(|_| Fault::internal())? {
+        if kind.is_empty()
+            && full_state == serde_json::to_vec(&*guard).map_err(|_| Fault::internal())?
+        {
             *guard = next;
             return Ok(output);
         }
+        let plain = storage_snapshot(&next)?;
+        if plain.len() > 16 << 20 {
+            return Err(Fault::internal());
+        }
+        let native_settings = serde_json::to_string(&NativeToolSettings::from(&next.settings))
+            .map_err(|_| Fault::internal())?;
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let encrypted = self
             .cipher
@@ -568,6 +648,8 @@ impl Store {
             let mut tx = self.db.begin().await?;
             sqlx::query("INSERT INTO vault (id,payload) VALUES (1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload")
                 .bind(payload).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO native_tool_settings (id,payload) VALUES (1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload")
+                .bind(native_settings).execute(&mut *tx).await?;
             if !kind.is_empty() {
                 sqlx::query("INSERT INTO events(at,kind,data) VALUES(?,?,?)")
                     .bind(now()).bind(kind).bind(event.to_string()).execute(&mut *tx).await?;
@@ -866,4 +948,140 @@ pub fn import_v1(state: &mut Snapshot, bytes: &[u8], key: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BrowserProfile;
+    use std::net::SocketAddr;
+    use tempfile::TempDir;
+
+    fn config(data_dir: &TempDir) -> Config {
+        Config {
+            browser_profile: BrowserProfile::Chrome146,
+            public_bind: "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+            control_bind: "127.0.0.1:18082".parse().unwrap(),
+            gateway_key: "gateway-store-test-key-at-least-32-bytes".to_owned(),
+            admin_key: "admin-store-test-key-at-least-32-bytes".to_owned(),
+            bot_key: String::new(),
+            data_dir: data_dir.path().to_owned(),
+            import_state: None,
+            base_url: "http://127.0.0.1:8080".to_owned(),
+            locale: "en-US".to_owned(),
+            timezone: "UTC".to_owned(),
+            default_model: "test".to_owned(),
+            effort: "medium".to_owned(),
+            legacy_thinking: "off".to_owned(),
+            accounts: vec![],
+            settings: Settings::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn native_tool_settings_live_outside_legacy_snapshot_and_survive_reopen() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let config = config(&data_dir);
+        let store = Store::open(&config).await.unwrap();
+        store
+            .mutate("settings_updated", json!({}), |snapshot| {
+                snapshot.settings.native_web_search = false;
+                snapshot.settings.native_artifacts = true;
+                snapshot.settings.native_repl = false;
+                snapshot.settings.native_widgets = true;
+                snapshot.settings.native_project_knowledge = false;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let encrypted: Vec<u8> = sqlx::query_scalar("SELECT payload FROM vault WHERE id=1")
+            .fetch_one(&store.db)
+            .await
+            .unwrap();
+        let plain = store
+            .cipher
+            .decrypt(
+                Nonce::from_slice(&encrypted[..12]),
+                Payload {
+                    msg: &encrypted[12..],
+                    aad: b"Claud2Api/snapshot/1",
+                },
+            )
+            .unwrap();
+        let persisted: Value = serde_json::from_slice(&plain).unwrap();
+        let legacy_settings = persisted["settings"].clone();
+        assert!(legacy_settings.get("session_ttl_seconds").is_some());
+        for field in [
+            "native_web_search",
+            "native_artifacts",
+            "native_repl",
+            "native_widgets",
+            "native_project_knowledge",
+        ] {
+            assert!(
+                legacy_settings.get(field).is_none(),
+                "{field} must not be in the vault"
+            );
+        }
+        // The published alpha4 Settings parser denies unknown fields.
+        let _: Settings = serde_json::from_value(legacy_settings).unwrap();
+
+        let native_payload: String =
+            sqlx::query_scalar("SELECT payload FROM native_tool_settings WHERE id=1")
+                .fetch_one(&store.db)
+                .await
+                .unwrap();
+        let native_settings = parse_native_tool_settings(&native_payload).unwrap();
+        assert!(!native_settings.native_web_search);
+        assert!(native_settings.native_artifacts);
+        assert!(!native_settings.native_repl);
+        assert!(native_settings.native_widgets);
+        assert!(!native_settings.native_project_knowledge);
+        let four_flag_record: NativeToolSettings = serde_json::from_value(json!({
+            "native_web_search": false,
+            "native_artifacts": true,
+            "native_repl": false,
+            "native_widgets": true
+        }))
+        .unwrap();
+        assert!(four_flag_record.native_project_knowledge);
+        drop(store);
+
+        let reopened = Store::open(&config).await.unwrap();
+        let settings = reopened.read().await.settings;
+        assert!(!settings.native_web_search);
+        assert!(settings.native_artifacts);
+        assert!(!settings.native_repl);
+        assert!(settings.native_widgets);
+        assert!(!settings.native_project_knowledge);
+    }
+
+    #[tokio::test]
+    async fn malformed_native_tool_settings_fail_closed_on_open() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let config = config(&data_dir);
+        let store = Store::open(&config).await.unwrap();
+        drop(store);
+
+        let db_path = data_dir.path().join("control.sqlite3");
+        let db = SqlitePoolOptions::new()
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .create_if_missing(false),
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE native_tool_settings SET payload=? WHERE id=1")
+            .bind(
+                r#"{"native_web_search":"false","native_artifacts":true,"native_repl":false,"native_widgets":true}"#,
+            )
+            .execute(&db)
+            .await
+            .unwrap();
+        db.close().await;
+
+        assert!(Store::open(&config).await.is_err());
+    }
 }

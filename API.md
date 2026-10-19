@@ -175,24 +175,98 @@ blocks. IDs, all result text and is_error survive prompt conversion.
 
 Custom tools have name, description and an object `input_schema`. JSON Schema
 validation supports local schema references; remote/file schema loading is
-disabled. Duplicate names and unsupported tool types are rejected. The bridge
-does not execute any tool. Tool choice supports auto, none, any and tool (named),
-plus disable_parallel_tool_use. Invalid model-generated arguments or violations
-of required tool choice are errors, not fabricated tool results.
+disabled. Duplicate names and unsupported tool types are rejected. The client
+executes custom tools and submits their results in a later user `tool_result`.
+Tool choice supports auto, none, any and tool (named), plus
+disable_parallel_tool_use. Invalid model-generated arguments or violations of
+required tool choice are errors, not fabricated client-tool results.
+
+### Claude web tools (Claud2Api extension)
+
+Messages can enable remote Claude web tool groups: web search and fetch
+(`web_search`), Artifacts (`artifacts`), remote code and file tools (`repl`), and
+a set of 37 current web widget descriptors (`widgets`). If `claud2api_tools` is
+omitted, administrator-enabled groups are used. An array selects groups for one
+request; `[]` disables them. Requesting a group disabled by the administrator
+returns 400 before an account is assigned.
+Standard `tools` and `tool_choice` only control client tools; they do not select
+or disable native groups.
+Widgets include ask-user, information, consent-prompt and scheduling-display
+cards. They are returned as web component data; the gateway does not grant
+an interactive reply path for these cards, grant consent, connect MCP services
+or execute scheduled actions. Availability depends on the upstream account.
+
+```json
+{
+  "model": "claude-sonnet-5-5",
+  "max_tokens": 1024,
+  "claud2api_tools": ["web_search"],
+  "messages": [{"role":"user","content":"Search Claude's official site and summarize it."}]
+}
+```
+
+These tools run in Claude's remote environment. The gateway never runs
+model-generated commands on its own host. Calls and results are returned as
+explicit `claud2api_native` blocks. Their `block` field preserves the upstream
+`tool_use` or `tool_result` object; tool errors retain `is_error`. Tool input and
+structured result data are preserved; upstream approval keys and MCP server-address
+control metadata are removed. Round-trip the returned assistant `content` array
+unchanged in the complete history; do not create a separate `tool_result`. The
+next request validates and retains those blocks, and the selected tool groups are
+part of the session fingerprint.
+
+Citations also use `claud2api_native`, with `block.type` set to `citation`; the
+nested `block.citation` has available source fields plus `text_block_index`,
+`start_index`, `end_index` and `cited_text`. Offsets count Unicode characters in the original text block. These
+web-session source objects differ from the encrypted citation format of the
+official API. Dated official API server-tool blocks remain unsupported; use
+`claud2api_tools` instead. Custom MCP connections, authorization execution and
+scheduling actions are outside this extension.
+
+Project knowledge search binds one known project through
+`claud2api_project_uuid`, a canonical lowercase UUID. The gateway does not list or
+read an account's private projects; the selected upstream account must already
+have access. When a UUID is supplied and the administrator has enabled project
+knowledge, omitting `claud2api_tools` adds `project_knowledge` to the four default
+groups. An explicit array may select it. Selecting it without a UUID is a 400
+error. If the administrator disabled project knowledge, any project UUID is
+rejected, even when `claud2api_tools` is `[]`. Project UUID and tool groups are
+part of the Messages session fingerprint; changing them starts a fresh upstream
+conversation, so continue sending complete supported history.
+
+```json
+{
+  "claud2api_project_uuid": "<replace with an authorized canonical lowercase project UUID>",
+  "claud2api_tools": ["project_knowledge"]
+}
+```
+
+When Messages, Chat or Responses return a generated output file, the gateway adds
+`claud2api_download_url` to the `local_resource` item in `tool_result.content` or
+to `tool_result.structured_content` when it contains an output path. Fetch the
+provided link at `GET /v1/native-files/{opaque-handle}` using the same API
+credential that created it (the same API token or configured gateway key).
+The encrypted, owner-bound link expires within one hour; downloads are limited to
+32 MiB and forced as attachments. The originating upstream conversation is kept
+until the link expires. Upstream authorization flags are never auto-approved.
 
 ## Responses and streaming
 
 Responses have id, type message, role assistant, content, model, stop_reason,
-stop_sequence and usage. A tool request ends with stop_reason tool_use. The client
-executes that tool and submits the complete transcript with a user tool_result.
-No proxy-generated tool_result is returned as an assistant content block.
+stop_sequence and usage. A client-tool request ends with stop_reason tool_use;
+the client executes it and submits the complete transcript with a user
+tool_result. Native web tools execute remotely in the same turn and return their
+result blocks in the assistant response.
 
 SSE frames use `event: <type>` and `data: <JSON>`. The stream contains
 message_start, content_block_start/delta/stop, message_delta and message_stop.
 Tool deltas use input_json_delta; arguments are emitted after complete validation.
 An interrupted stream or invalid tool frame ends with error rather than a
-successful message_stop. Text streams as upstream deltas arrive; no fake delays
-are added. The first event may wait for the first supported upstream content.
+successful message_stop. Native tool deltas use `claud2api_native_delta` and
+contain the raw upstream delta; the matching `content_block_stop` carries the
+complete block in `claud2api_block`, which replaces the partial block in history.
+Text streams as upstream deltas arrive; no fake delays are added. The first event
+may wait for the first supported upstream content.
 
 ## Limits and unsupported capabilities
 
@@ -211,7 +285,8 @@ are added. The first event may wait for the first supported upstream content.
   locally until explicit operator review through the private control API.
   Pauses, pacing and cooldowns survive restart; restart does not clear them.
 - `X-Claud2Api-Limitations` declares estimated usage, advisory max_tokens,
-  the text-tool bridge and `controls-not-forwarded`. Discarded controls do not
+  the text client-tool bridge, native web-tool extensions and
+  `controls-not-forwarded`. Discarded controls do not
   produce warnings in the response content or request failures.
 - Usage is a character-based estimate, not official token accounting or billing.
   Prompt-cache counters are enabled by default for new installations. The setting
@@ -246,8 +321,16 @@ are added. The first event may wait for the first supported upstream content.
   remain compatibility interfaces. Models use an OpenAI-style catalog shape, not
   the complete native Anthropic model-list schema. Chat accepts text messages;
   Responses accepts text input or ordered text messages and optional instructions.
-  String content and supported text blocks preserve their roles. Non-text blocks
-  and unsupported tool calls are rejected; no native web tools are enabled.
+  String content and supported text blocks preserve their roles. Client tool
+  definitions and tool histories remain unsupported, but requests can select native
+  web tool groups with `claud2api_tools`. Chat and Responses expose
+  `claud2api_native` and `claud2api_citations`; Chat and Responses SSE also use
+  `claud2api.native_start`, `claud2api.native_delta`, `claud2api.native_stop`
+  and `claud2api.citation` extension events. Responses adds a standard
+  `url_citation` annotation only when the cited text uniquely matches the output.
+  Inputs stay text-structured; native extension blocks in a response cannot be
+  submitted as history through these adapters. Use Messages for full structural
+  round-tripping.
   Both can stream. Usage estimates the actual bridge prompt and output with the
   same character estimator; total tokens is their sum. Chat streaming accepts
   `stream_options.include_usage` for a final usage-only chunk on success.
@@ -259,6 +342,9 @@ are added. The first event may wait for the first supported upstream content.
   This extension appends each payload to the existing web conversation: send
   only new messages when using it. Clients resending complete history should
   omit conversation_id; this adapter does not deduplicate compatibility history.
+  With a conversation_id, keep `claud2api_tools` and `claud2api_project_uuid`
+  unchanged. Changing either returns 409 before upstream access; retain the old
+  settings or start with a new conversation_id.
   They do not share the durable Messages session deletion path or its automatic
   context/summary and quota-migration behavior.
 

@@ -676,11 +676,26 @@ async fn settings(State(e): State<Arc<Engine>>) -> Json<Value> {
 #[serde(deny_unknown_fields)]
 struct SettingsUpdate {
     expected_revision: u64,
-    settings: Settings,
+    settings: Value,
 }
 async fn update_settings(State(e): State<Arc<Engine>>, bytes: Bytes) -> Result<Json<Value>> {
     let input: SettingsUpdate = decode(&bytes)?;
-    input.settings.validate()?;
+    for field in [
+        "native_web_search",
+        "native_artifacts",
+        "native_repl",
+        "native_widgets",
+        "native_project_knowledge",
+    ] {
+        if !input.settings.get(field).is_some_and(Value::is_boolean) {
+            return Err(Fault::invalid(
+                "submit the complete settings from GET /settings; reload the console before saving",
+            ));
+        }
+    }
+    let settings: Settings = serde_json::from_value(input.settings)
+        .map_err(|_| Fault::invalid("invalid runtime settings"))?;
+    settings.validate()?;
     let value = e
         .store
         .mutate(
@@ -688,7 +703,7 @@ async fn update_settings(State(e): State<Arc<Engine>>, bytes: Bytes) -> Result<J
             json!({"expected_revision":input.expected_revision}),
             |s| {
                 revision(s, input.expected_revision)?;
-                s.settings = input.settings;
+                s.settings = settings;
                 s.revision += 1;
                 Ok(json!({"schema_version":1,"revision":s.revision}))
             },

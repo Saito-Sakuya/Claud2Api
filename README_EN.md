@@ -4,7 +4,7 @@
 
 <h1 align="center">Claud2Api</h1>
 
-<p align="center"><strong>v0.1.0-alpha.4</strong></p>
+<p align="center"><strong>v0.1.0-alpha.5</strong></p>
 
 <p align="center">
   <a href="DEPLOY_EN.md"><img src="docs/badges/linux-amd64.svg" alt="Supported platform: Linux AMD64" height="26" /></a>
@@ -16,6 +16,8 @@
 Claud2Api provides a Messages-compatible service and a private administration
 console for accounts, browser profiles, account proxies, model configuration,
 API tokens, sessions, estimated usage and message-status logs.
+Messages can also use Claude web search/fetch, Artifacts, remote code/file tools,
+information widgets and a specified project's knowledge, subject to account access.
 
 ## Installation
 
@@ -90,8 +92,8 @@ Open `http://127.0.0.1:18082/` and sign in with the separate key in `admin-key.t
   on creation.
 - **Sticky sessions:** inspect and clear idle sessions; default expiry is one
   hour after the last successful request.
-- **Runtime settings:** change session/request/scheduling limits. Simulated
-  one-hour cache display is enabled by default.
+- **Runtime settings:** change session/request/scheduling limits and toggle each
+  native web-tool group. Simulated one-hour cache display is enabled by default.
 - **Version manager:** check at startup and every five minutes, with an amber glow
   for updates. Upgrade compatible versions or roll back to the two preceding
   published releases while retaining data, then reload the panel automatically.

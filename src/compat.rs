@@ -2,6 +2,7 @@ use crate::{
     engine::Engine,
     error::{Fault, Result},
     guard::{Lease, Scope},
+    native_stream::{WebBlockDecoder, WebEmission},
     observability::RequestTrace,
     protocol,
     store::{Usage, nonce, now},
@@ -15,11 +16,16 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::{Map, Value, json};
-use std::{collections::HashSet, convert::Infallible, sync::Arc};
+use std::{
+    collections::{HashSet, VecDeque},
+    convert::Infallible,
+    sync::Arc,
+};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
 
-const BRIDGE: &str = "Continue the conversation using this JSON transcript. Reply only with the assistant's answer. Do not use tools.";
+const BRIDGE: &str =
+    "Continue the conversation using this JSON transcript. Reply only with the assistant's answer.";
 const MAX_OUTPUT_BYTES: usize = 8 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +40,8 @@ struct Projection {
     stream: bool,
     include_usage: bool,
     conversation_id: Option<String>,
+    native_tools: Option<Value>,
+    project_uuid: Option<String>,
     prompt: String,
 }
 
@@ -44,6 +52,8 @@ impl Projection {
         let stream = optional_bool(object, "stream", false)?;
         let conversation_id =
             validate_conversation_id(optional_string(object, "conversation_id")?)?;
+        let native_tools = object.get("claud2api_tools").cloned();
+        let project_uuid = crate::native_tools::project(raw)?;
         reject_tools(object)?;
         let include_usage = match object.get("stream_options") {
             None => false,
@@ -93,6 +103,8 @@ impl Projection {
             stream,
             include_usage,
             conversation_id,
+            native_tools,
+            project_uuid,
             prompt,
         })
     }
@@ -103,6 +115,8 @@ impl Projection {
         let stream = optional_bool(object, "stream", false)?;
         let conversation_id =
             validate_conversation_id(optional_string(object, "conversation_id")?)?;
+        let native_tools = object.get("claud2api_tools").cloned();
+        let project_uuid = crate::native_tools::project(raw)?;
         reject_tools(object)?;
         let instructions = match object.get("instructions") {
             None => None,
@@ -169,6 +183,8 @@ impl Projection {
             stream,
             include_usage: false,
             conversation_id,
+            native_tools,
+            project_uuid,
             prompt,
         })
     }
@@ -328,6 +344,14 @@ struct Active {
     prompt: String,
     target: String,
     conversation_key: Option<String>,
+    tool_descriptors: Value,
+    decoder: WebBlockDecoder,
+    emissions: VecDeque<WebEmission>,
+    upstream_done: bool,
+    native_blocks: Vec<Value>,
+    citations: Vec<Value>,
+    native_bytes: usize,
+    file_until: i64,
     persistent: bool,
     assistant: String,
     _conversation_lock: Option<OwnedSemaphorePermit>,
@@ -336,7 +360,55 @@ struct Active {
 
 enum Pull {
     Text(String),
+    NativeStart(Value),
+    NativeDelta(Value),
+    NativeStop(Value),
+    Citation(Value),
     Done,
+}
+
+fn profiled_legacy_key(base_key: &str, gateway_key: &str, groups: &[String]) -> String {
+    protocol::digest(
+        gateway_key,
+        "legacy-token-session-native-tools",
+        &(base_key, groups),
+    )
+}
+
+fn project_legacy_key(
+    base_key: &str,
+    gateway_key: &str,
+    groups: &[String],
+    project: &Option<String>,
+) -> String {
+    if groups.is_empty() && project.is_none() {
+        return base_key.to_owned();
+    }
+    match project {
+        Some(project) => format!(
+            "{base_key}:{}",
+            protocol::digest(gateway_key, "legacy-project-tools", &(groups, project))
+        ),
+        None => format!(
+            "{base_key}:{}",
+            profiled_legacy_key(base_key, gateway_key, groups)
+        ),
+    }
+}
+
+fn legacy_profile_keys(base_key: &str, gateway_key: &str) -> Vec<String> {
+    let groups = ["web_search", "artifacts", "repl", "widgets"];
+    let mut keys = vec![base_key.to_owned()];
+    for mask in 0..(1usize << groups.len()) {
+        let profile: Vec<String> = groups
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| mask & (1 << index) != 0)
+            .map(|(_, group)| (*group).to_owned())
+            .collect();
+        keys.push(profiled_legacy_key(base_key, gateway_key, &profile));
+    }
+    keys
 }
 
 struct PendingCleanup {
@@ -439,21 +511,61 @@ async fn begin(
     let public_model = selected.public;
     let model = selected.upstream;
     let settings = engine.store.read().await.settings;
+    let mut native_options = projection
+        .native_tools
+        .as_ref()
+        .map(|value| json!({"claud2api_tools":value}))
+        .unwrap_or_else(|| json!({}));
+    if let Some(project) = &projection.project_uuid {
+        native_options["claud2api_project_uuid"] = json!(project);
+    }
+    let native_profile = crate::native_tools::resolve(&native_options, &settings)?;
+    let native_allowed_names = crate::native_tools::allowed_names(&native_profile);
+    let tool_descriptors = crate::native_tools::descriptors(&native_profile);
     let mut scope = Scope::new(settings.request_timeout_seconds);
     scope.trace = Some(trace.clone());
 
-    let conversation_key = projection
+    let conversation_base_key = projection
         .conversation_id
         .as_deref()
         .filter(|id| !id.is_empty())
         .map(|id| trace.legacy_key(id, &engine.config.gateway_key));
-    let conversation_lock = if let Some(key) = &conversation_key {
+    let conversation_key = conversation_base_key.as_ref().map(|base_key| {
+        project_legacy_key(
+            base_key,
+            &engine.config.gateway_key,
+            &native_profile,
+            &projection.project_uuid,
+        )
+    });
+    let conversation_lock = if let Some(key) = &conversation_base_key {
         engine.legacy_lock(key).await?
     } else {
         None
     };
     let previous = if let Some(key) = &conversation_key {
-        engine.legacy.lock().await.get(key).cloned()
+        let legacy = engine.legacy.lock().await;
+        if let Some(previous) = legacy.get(key) {
+            Some(previous.clone())
+        } else {
+            let base_key = conversation_base_key
+                .as_ref()
+                .expect("conversation key exists");
+            if legacy_profile_keys(base_key, &engine.config.gateway_key)
+                .iter()
+                .any(|candidate| legacy.contains_key(candidate))
+                || legacy
+                    .keys()
+                    .any(|candidate| candidate.starts_with(&format!("{base_key}:")))
+            {
+                return Err(Fault::new(
+                    409,
+                    "invalid_request_error",
+                    "native tools or project changed for this conversation; retain its configuration or use a new conversation_id",
+                ));
+            }
+            None
+        }
     } else {
         None
     };
@@ -491,6 +603,13 @@ async fn begin(
                 .await;
             return Err(fault);
         }
+        if let Some(project) = &projection.project_uuid {
+            lease
+                .slot
+                .client
+                .bind_project(&lease, &scope, &target, project)
+                .await?;
+        }
         (target, String::new())
     };
     let persistent = conversation_key.is_some();
@@ -520,6 +639,14 @@ async fn begin(
         prompt: projection.prompt,
         target,
         conversation_key,
+        tool_descriptors,
+        decoder: WebBlockDecoder::new(native_allowed_names),
+        emissions: VecDeque::new(),
+        upstream_done: false,
+        native_blocks: Vec::new(),
+        citations: Vec::new(),
+        native_bytes: 0,
+        file_until: 0,
         persistent,
         assistant: String::new(),
         _conversation_lock: conversation_lock,
@@ -572,7 +699,7 @@ async fn start_completion(active: &mut Active) -> Result<()> {
                 parent: &active.parent,
                 model: &active.model,
                 prompt: &active.prompt,
-                tools: json!([]),
+                tools: active.tool_descriptors.clone(),
                 thinking: &active.thinking,
             },
         )
@@ -593,7 +720,17 @@ async fn complete_active(active: &mut Active, text: &str) -> Result<Value> {
                     state.pending.retain(|job| {
                         job.account_id != active.lease.account_id
                             || job.conversation_id != active.target
+                            || job.next_attempt > now()
                     });
+                    if active.file_until > now() {
+                        state.queue(&active.lease.account_id, &active.target);
+                        if let Some(job) = state.pending.iter_mut().find(|job| {
+                            job.account_id == active.lease.account_id
+                                && job.conversation_id == active.target
+                        }) {
+                            job.next_attempt = job.next_attempt.max(active.file_until);
+                        }
+                    }
                     Ok(())
                 })
                 .await?;
@@ -607,17 +744,36 @@ async fn complete_active(active: &mut Active, text: &str) -> Result<Value> {
             );
         }
     } else if let Some(cleanup) = &mut active.cleanup {
-        cleanup.run_with_lease(&active.lease).await;
+        if active.file_until > now() {
+            active
+                .engine
+                .store
+                .mutate("", json!({}), |state| {
+                    state.queue(&active.lease.account_id, &active.target);
+                    if let Some(job) = state.pending.iter_mut().find(|job| {
+                        job.account_id == active.lease.account_id
+                            && job.conversation_id == active.target
+                    }) {
+                        job.next_attempt = job.next_attempt.max(active.file_until);
+                    }
+                    Ok(())
+                })
+                .await?;
+            cleanup.armed = false;
+        } else {
+            cleanup.run_with_lease(&active.lease).await;
+        }
     }
 
-    let usage = token_usage(&active.prompt, text);
+    let accounted_output = accounting_output(text, &active.native_blocks, &active.citations)?;
+    let usage = token_usage(&active.prompt, &accounted_output);
     record_usage(
         &active.engine,
         &active.lease,
         &active.scope,
         &active.model,
         &active.prompt,
-        text,
+        &accounted_output,
         200,
     )
     .await?;
@@ -626,6 +782,12 @@ async fn complete_active(active: &mut Active, text: &str) -> Result<Value> {
 
 async fn pull_text(active: &mut Active, output: &mut String) -> Result<Pull> {
     loop {
+        if let Some(emission) = active.emissions.pop_front() {
+            return emission_to_pull(active, output, emission);
+        }
+        if active.upstream_done {
+            return Ok(Pull::Done);
+        }
         let scope = &active.scope;
         let event = active
             .completion
@@ -637,33 +799,114 @@ async fn pull_text(active: &mut Active, output: &mut String) -> Result<Pull> {
             let status = crate::transport::error_status(crate::transport::error_code(&event));
             return Err(active.lease.failure(status, None).await?);
         }
+        let emissions = active.decoder.feed(&event)?;
         if event["type"] == "message_stop" {
-            return Ok(Pull::Done);
+            active.decoder.finish()?;
+            active.upstream_done = true;
         }
-        if let Some(delta) = event.pointer("/delta/text").and_then(Value::as_str) {
-            if output.len().saturating_add(delta.len()) > MAX_OUTPUT_BYTES {
+        active.emissions.extend(emissions);
+        if let Some(emission) = active.emissions.pop_front() {
+            return emission_to_pull(active, output, emission);
+        }
+    }
+}
+
+fn emission_to_pull(
+    active: &mut Active,
+    output: &mut String,
+    emission: WebEmission,
+) -> Result<Pull> {
+    match emission {
+        WebEmission::Text(delta) => {
+            if output
+                .len()
+                .saturating_add(active.native_bytes)
+                .saturating_add(delta.len())
+                > MAX_OUTPUT_BYTES
+            {
                 return Err(Fault::new(
                     502,
                     "api_error",
                     "upstream output exceeds limit",
                 ));
             }
-            output.push_str(delta);
-            return Ok(Pull::Text(delta.to_owned()));
+            output.push_str(&delta);
+            Ok(Pull::Text(delta))
+        }
+        WebEmission::Citation(citation) => {
+            let citation = crate::native_tools::sanitize(citation);
+            let size = serde_json::to_vec(&citation)
+                .map_err(|_| Fault::upstream())?
+                .len();
+            active.native_bytes = active.native_bytes.saturating_add(size);
+            if output.len().saturating_add(active.native_bytes) > MAX_OUTPUT_BYTES {
+                return Err(Fault::new(
+                    502,
+                    "api_error",
+                    "upstream output exceeds limit",
+                ));
+            }
+            active.citations.push(citation.clone());
+            Ok(Pull::Citation(citation))
+        }
+        WebEmission::NativeStart(block) => {
+            Ok(Pull::NativeStart(crate::native_tools::sanitize(block)))
+        }
+        WebEmission::NativeDelta(delta) => {
+            Ok(Pull::NativeDelta(crate::native_tools::sanitize(delta)))
+        }
+        WebEmission::NativeStop(block) => {
+            let decorated = crate::native_files::decorate(
+                crate::native_tools::sanitize(block),
+                &active.engine.config.gateway_key,
+                &active.trace.token_id(),
+                &active.lease.account_id,
+                &active.target,
+                3600,
+            )?;
+            active.file_until = active.file_until.max(decorated.expires_at.unwrap_or(0));
+            let block = decorated.block;
+            let size = serde_json::to_vec(&block)
+                .map_err(|_| Fault::upstream())?
+                .len();
+            active.native_bytes = active.native_bytes.saturating_add(size);
+            if output.len().saturating_add(active.native_bytes) > MAX_OUTPUT_BYTES {
+                return Err(Fault::new(
+                    502,
+                    "api_error",
+                    "upstream output exceeds limit",
+                ));
+            }
+            active.native_blocks.push(block.clone());
+            Ok(Pull::NativeStop(block))
         }
     }
+}
+
+fn accounting_output(text: &str, native: &[Value], citations: &[Value]) -> Result<String> {
+    if native.is_empty() && citations.is_empty() {
+        return Ok(text.to_owned());
+    }
+    let extension = serde_json::to_string(&json!({
+        "claud2api_native": native,
+        "claud2api_citations": citations,
+    }))
+    .map_err(|_| Fault::internal())?;
+    Ok(format!("{text}{extension}"))
 }
 
 async fn fail_active(active: &mut Active, output: &str, fault: &Fault) {
     active.completion.take();
     active.trace.fail(fault.status);
+    let accounted_output = accounting_output(output, &active.native_blocks, &active.citations)
+        .unwrap_or_else(|_| output.to_owned());
     let _ = record_usage(
         &active.engine,
         &active.lease,
         &active.scope,
         &active.model,
         &active.prompt,
-        output,
+        &accounted_output,
         fault.status,
     )
     .await;
@@ -673,7 +916,7 @@ async fn fail_active(active: &mut Active, output: &str, fault: &Fault) {
 }
 
 fn chat_chunk(active: &Active, delta: Value, finish_reason: Option<&str>) -> Value {
-    json!({
+    let mut chunk = json!({
         "id": active.response_id,
         "object": "chat.completion.chunk",
         "created": active.created,
@@ -684,7 +927,13 @@ fn chat_chunk(active: &Active, delta: Value, finish_reason: Option<&str>) -> Val
             "finish_reason": finish_reason,
         }],
         "usage": null,
-    })
+    });
+    if finish_reason.is_some() {
+        let object = chunk.as_object_mut().expect("chat chunk object");
+        object.insert("claud2api_native".into(), json!(active.native_blocks));
+        object.insert("claud2api_citations".into(), json!(active.citations));
+    }
+    chunk
 }
 
 fn chat_document(active: &Active, text: &str, usage: &Value) -> Value {
@@ -703,7 +952,39 @@ fn chat_document(active: &Active, text: &str, usage: &Value) -> Value {
             "completion_tokens": usage["output_tokens"],
             "total_tokens": usage["total_tokens"],
         },
+        "claud2api_native": active.native_blocks,
+        "claud2api_citations": active.citations,
     })
+}
+
+fn response_annotations(citations: &[Value], text: &str) -> Vec<Value> {
+    citations
+        .iter()
+        .filter_map(|citation| {
+            let url = citation.get("url")?.as_str()?;
+            let title = citation.get("title")?.as_str()?;
+            let cited_text = citation.get("cited_text")?.as_str()?;
+            let start = citation.get("start_index")?.as_u64()? as usize;
+            let end = citation.get("end_index")?.as_u64()? as usize;
+            if cited_text.is_empty() || end < start || end - start != cited_text.chars().count() {
+                return None;
+            }
+            let mut matches = text.match_indices(cited_text);
+            let (byte_index, _) = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            let start_index = text[..byte_index].chars().count();
+            let end_index = start_index + cited_text.chars().count();
+            Some(json!({
+                "type":"url_citation",
+                "start_index":start_index,
+                "end_index":end_index,
+                "url":url,
+                "title":title,
+            }))
+        })
+        .collect()
 }
 
 fn response_message(active: &Active, text: &str) -> Value {
@@ -715,7 +996,7 @@ fn response_message(active: &Active, text: &str) -> Value {
         "content": [{
             "type": "output_text",
             "text": text,
-            "annotations": [],
+            "annotations": response_annotations(&active.citations, text),
         }],
     })
 }
@@ -729,6 +1010,8 @@ fn response_document(active: &Active, text: &str, usage: &Value) -> Value {
         "model": active.public_model,
         "output": [response_message(active, text)],
         "usage": usage,
+        "claud2api_native": active.native_blocks,
+        "claud2api_citations": active.citations,
     })
 }
 
@@ -742,6 +1025,36 @@ fn sse_data(value: &Value) -> Bytes {
 
 fn sse_event(kind: &str, value: &Value) -> Bytes {
     Bytes::from(format!("event: {kind}\ndata: {value}\n\n"))
+}
+
+fn chat_extension(active: &Active, kind: &str, field: &str, value: Value) -> Bytes {
+    let mut payload = json!({
+        "id":active.response_id,
+        "model":active.public_model,
+    });
+    payload
+        .as_object_mut()
+        .expect("chat extension object")
+        .insert(field.to_owned(), value);
+    sse_event(kind, &payload)
+}
+
+fn response_extension(
+    active: &Active,
+    kind: &str,
+    sequence: usize,
+    field: &str,
+    value: Value,
+) -> Value {
+    let mut payload = json!({
+        "response_id":active.response_id,
+        "item_id":active.item_id,
+    });
+    payload
+        .as_object_mut()
+        .expect("response extension object")
+        .insert(field.to_owned(), value);
+    response_event(kind, sequence, payload)
 }
 
 struct CancelOnDrop(CancellationToken);
@@ -788,6 +1101,18 @@ fn chat_stream(mut active: Active, include_usage: bool) -> Response {
                     let chunk = chat_chunk(&active, json!({"content":delta}), None);
                     yield Ok(sse_data(&chunk));
                 }
+                Ok(Pull::NativeStart(block)) => {
+                    yield Ok(chat_extension(&active, "claud2api.native_start", "block", block));
+                }
+                Ok(Pull::NativeDelta(delta)) => {
+                    yield Ok(chat_extension(&active, "claud2api.native_delta", "delta", delta));
+                }
+                Ok(Pull::NativeStop(block)) => {
+                    yield Ok(chat_extension(&active, "claud2api.native_stop", "block", block));
+                }
+                Ok(Pull::Citation(citation)) => {
+                    yield Ok(chat_extension(&active, "claud2api.citation", "citation", citation));
+                }
                 Ok(Pull::Done) => {
                     match complete_active(&mut active, &output).await {
                         Ok(usage) => {
@@ -805,6 +1130,8 @@ fn chat_stream(mut active: Active, include_usage: bool) -> Response {
                                         "completion_tokens": usage["output_tokens"],
                                         "total_tokens": usage["total_tokens"],
                                     },
+                                    "claud2api_native": active.native_blocks,
+                                    "claud2api_citations": active.citations,
                                 });
                                 yield Ok(sse_data(&usage_chunk));
                             }
@@ -905,6 +1232,50 @@ fn response_stream(mut active: Active) -> Response {
                     yield Ok(sse_event("response.output_text.delta", &event));
                     sequence += 1;
                 }
+                Ok(Pull::NativeStart(block)) => {
+                    let event = response_extension(
+                        &active,
+                        "claud2api.native_start",
+                        sequence,
+                        "block",
+                        block,
+                    );
+                    yield Ok(sse_event("claud2api.native_start", &event));
+                    sequence += 1;
+                }
+                Ok(Pull::NativeDelta(delta)) => {
+                    let event = response_extension(
+                        &active,
+                        "claud2api.native_delta",
+                        sequence,
+                        "delta",
+                        delta,
+                    );
+                    yield Ok(sse_event("claud2api.native_delta", &event));
+                    sequence += 1;
+                }
+                Ok(Pull::NativeStop(block)) => {
+                    let event = response_extension(
+                        &active,
+                        "claud2api.native_stop",
+                        sequence,
+                        "block",
+                        block,
+                    );
+                    yield Ok(sse_event("claud2api.native_stop", &event));
+                    sequence += 1;
+                }
+                Ok(Pull::Citation(citation)) => {
+                    let event = response_extension(
+                        &active,
+                        "claud2api.citation",
+                        sequence,
+                        "citation",
+                        citation,
+                    );
+                    yield Ok(sse_event("claud2api.citation", &event));
+                    sequence += 1;
+                }
                 Ok(Pull::Done) => {
                     match complete_active(&mut active, &output).await {
                         Ok(usage) => {
@@ -920,7 +1291,11 @@ fn response_stream(mut active: Active) -> Response {
                                 "item_id": active.item_id,
                                 "output_index": 0,
                                 "content_index": 0,
-                                "part": {"type":"output_text","text":output,"annotations":[]},
+                                "part": {
+                                    "type":"output_text",
+                                    "text":output,
+                                    "annotations":response_annotations(&active.citations, &output),
+                                },
                             }));
                             yield Ok(sse_event("response.content_part.done", &part_done));
                             sequence += 1;
@@ -990,7 +1365,13 @@ async fn run_nonstream(mut active: Active) -> Result<Response> {
     }
     loop {
         match pull_text(&mut active, &mut output).await {
-            Ok(Pull::Text(_)) => {}
+            Ok(
+                Pull::Text(_)
+                | Pull::NativeStart(_)
+                | Pull::NativeDelta(_)
+                | Pull::NativeStop(_)
+                | Pull::Citation(_),
+            ) => {}
             Ok(Pull::Done) => {
                 let usage = complete_active(&mut active, &output).await?;
                 return Ok(json_response(&active, &output, &usage));
@@ -1052,33 +1433,52 @@ pub async fn remove(
     if conversation_id.is_empty() || conversation_id.len() > 512 {
         return Err(Fault::invalid("invalid conversation_id"));
     }
-    let key = trace.legacy_key(&conversation_id, &engine.config.gateway_key);
-    let _lock = engine.legacy_lock(&key).await?;
-    let mapping = engine.legacy.lock().await.get(&key).cloned();
-    let Some((account_id, upstream_id, _)) = mapping else {
-        return Err(Fault::new(404, "not_found_error", "conversation not found"));
+    let base_key = trace.legacy_key(&conversation_id, &engine.config.gateway_key);
+    let _lock = engine.legacy_lock(&base_key).await?;
+    let candidate_keys = legacy_profile_keys(&base_key, &engine.config.gateway_key);
+    let mappings: Vec<(String, String, String)> = {
+        let legacy = engine.legacy.lock().await;
+        candidate_keys
+            .iter()
+            .chain(
+                legacy
+                    .keys()
+                    .filter(|candidate| candidate.starts_with(&format!("{base_key}:"))),
+            )
+            .filter_map(|key| {
+                legacy
+                    .get(key)
+                    .cloned()
+                    .map(|mapping| (key.clone(), mapping.0, mapping.1))
+            })
+            .collect()
     };
+    if mappings.is_empty() {
+        return Err(Fault::new(404, "not_found_error", "conversation not found"));
+    }
     let settings = engine.store.read().await.settings;
     let scope = Scope::new(settings.request_timeout_seconds);
-    let lease = engine
-        .pool
-        .acquire(Some(&account_id), &HashSet::new(), &scope, false)
-        .await?;
-    lease
-        .slot
-        .client
-        .delete(&lease, &scope, &upstream_id)
-        .await?;
-    engine.legacy.lock().await.remove(&key);
-    engine
-        .store
-        .mutate("", json!({}), |state| {
-            state
-                .pending
-                .retain(|job| job.account_id != account_id || job.conversation_id != upstream_id);
-            Ok(())
-        })
-        .await?;
+    for (key, account_id, upstream_id) in mappings {
+        let lease = engine
+            .pool
+            .acquire(Some(&account_id), &HashSet::new(), &scope, false)
+            .await?;
+        lease
+            .slot
+            .client
+            .delete(&lease, &scope, &upstream_id)
+            .await?;
+        engine.legacy.lock().await.remove(&key);
+        engine
+            .store
+            .mutate("", json!({}), |state| {
+                state.pending.retain(|job| {
+                    job.account_id != account_id || job.conversation_id != upstream_id
+                });
+                Ok(())
+            })
+            .await?;
+    }
     Ok(Json(
         json!({"id":conversation_id,"object":"conversation.deleted","deleted":true}),
     ))
@@ -1153,6 +1553,36 @@ mod tests {
     }
 
     #[test]
+    fn native_tool_extension_is_independent_of_client_tool_fields() {
+        let raw = json!({
+            "model":"claude-test",
+            "claud2api_tools":["web_search","artifacts"],
+            "messages":[{"role":"user","content":"search"}]
+        });
+        let projection = Projection::chat(&raw).expect("native tool groups are accepted");
+        assert_eq!(
+            projection.native_tools,
+            Some(json!(["web_search", "artifacts"]))
+        );
+        assert!(!projection.prompt.contains("Do not use tools"));
+
+        let response = json!({
+            "model":"claude-test",
+            "claud2api_tools":[],
+            "input":"plain text"
+        });
+        let projection = Projection::responses(&response).expect("empty group list is accepted");
+        assert_eq!(projection.native_tools, Some(json!([])));
+
+        let client_function = json!({
+            "model":"claude-test",
+            "tools":[],
+            "messages":[{"role":"user","content":"run"}]
+        });
+        assert_eq!(Projection::chat(&client_function).unwrap_err().status, 400);
+    }
+
+    #[test]
     fn text_projection_rejects_images_tools_and_wrong_field_types() {
         let image = json!({
             "model":"claude-test",
@@ -1186,6 +1616,65 @@ mod tests {
             usage["total_tokens"],
             usage["input_tokens"].as_u64().unwrap() + usage["output_tokens"].as_u64().unwrap()
         );
+    }
+
+    #[test]
+    fn structured_native_results_are_included_in_output_accounting() {
+        let text = "Answer";
+        let native = vec![json!({
+            "type":"tool_result",
+            "tool_use_id":"call_1",
+            "content":[{"type":"knowledge","title":"Guide","url":"https://example.com"}]
+        })];
+        let citations = vec![json!({"url":"https://example.com","cited_text":"Guide"})];
+        let accounted = accounting_output(text, &native, &citations).unwrap();
+        assert!(accounted.starts_with(text));
+        assert!(accounted.contains("https://example.com"));
+        assert!(protocol::estimate(&accounted) > protocol::estimate(text));
+    }
+
+    #[test]
+    fn response_annotations_use_real_unique_unicode_cited_text() {
+        let text = "开头 猫🌸 结尾";
+        let citations = vec![json!({
+            "url":"https://example.com/source",
+            "title":"Source",
+            "cited_text":"猫🌸",
+            "start_index":0,
+            "end_index":2,
+            "text_block_index":7
+        })];
+        assert_eq!(
+            response_annotations(&citations, text),
+            vec![json!({
+                "type":"url_citation",
+                "start_index":3,
+                "end_index":5,
+                "url":"https://example.com/source",
+                "title":"Source"
+            })]
+        );
+
+        let ambiguous = vec![json!({
+            "url":"https://example.com/source",
+            "title":"Source",
+            "cited_text":"猫🌸",
+            "start_index":0,
+            "end_index":2
+        })];
+        assert!(response_annotations(&ambiguous, "猫🌸 and 猫🌸").is_empty());
+    }
+
+    #[test]
+    fn persistent_keys_change_when_native_tool_profile_changes() {
+        let base = "opaque-session-key";
+        let secret = "test-gateway-secret";
+        let empty = profiled_legacy_key(base, secret, &[]);
+        assert_eq!(project_legacy_key(base, secret, &[], &None), base);
+        let search = profiled_legacy_key(base, secret, &["web_search".to_owned()]);
+        assert_eq!(empty, profiled_legacy_key(base, secret, &[]));
+        assert_ne!(empty, search);
+        assert_eq!(legacy_profile_keys(base, secret).len(), 17);
     }
 
     #[test]

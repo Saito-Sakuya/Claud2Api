@@ -2,7 +2,7 @@
 
 [中文](DOCS_ZH.md) · English
 
-These documents describe **v0.1.0-alpha.4**. Every maintained project guide has a
+These documents describe **v0.1.0-alpha.5**. Every maintained project guide has a
 complete Chinese/English counterpart. Existing default filenames remain valid;
 use the language links below or at the top of each guide.
 

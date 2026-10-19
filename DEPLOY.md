@@ -83,6 +83,11 @@ cargo clippy --locked --all-targets -- -D warnings
 | `CONTEXT_BUDGET_TOKENS` | 128000 | 4096–1000000，本地保守预算单位 |
 | `CONTEXT_COMPACTION_TRIGGER_PERCENT` | 75 | 10–90 |
 | `CONTEXT_KEEP_RECENT_ROUNDS` | 6 | 1–32 个完整文本／工具单元 |
+| `NATIVE_WEB_SEARCH_ENABLED` | true | 开放网页搜索与读取工具组 |
+| `NATIVE_ARTIFACTS_ENABLED` | true | 开放 Artifacts 工具组 |
+| `NATIVE_REPL_ENABLED` | true | 开放远端代码与文件工具组 |
+| `NATIVE_WIDGETS_ENABLED` | true | 开放网页端 37 种信息与交互组件 |
+| `NATIVE_PROJECT_KNOWLEDGE_ENABLED` | true | 允许请求绑定的项目知识搜索；请求仍须提供项目 UUID |
 | `ACCOUNT_MIN_INTERVAL_SECONDS` | 5 | 1–300 秒 |
 | `ACCOUNT_REQUESTS_PER_MINUTE` | 6 | 1–60 次／滚动分钟 |
 | `ACCOUNT_RATE_LIMIT_COOLDOWN_SECONDS` | 60 | 60–86400 秒，限额冷却下限 |
@@ -104,7 +109,15 @@ services:
     environment:
       BROWSER_PROFILE: firefox_151_windows
       ACCOUNT_RATE_LIMIT_FALLBACK_SECONDS: "18000"
+      NATIVE_WEB_SEARCH_ENABLED: "true"
+      NATIVE_ARTIFACTS_ENABLED: "true"
+      NATIVE_REPL_ENABLED: "true"
+      NATIVE_WIDGETS_ENABLED: "true"
+      NATIVE_PROJECT_KNOWLEDGE_ENABLED: "true"
 ```
+
+原生工具开关也可直接在控制台逐组修改；Compose 未默认传入上述环境变量。
+它们只作为新状态的初始值，已保存的运行配置优先。
 
 显式加载覆盖文件后启动：
 

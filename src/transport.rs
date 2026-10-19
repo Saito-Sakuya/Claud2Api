@@ -81,6 +81,49 @@ pub struct WebClient {
     org: Mutex<String>,
     catalog: Mutex<(i64, Vec<String>)>,
 }
+
+fn valid_output_path(path: &str) -> bool {
+    const PREFIX: &str = "/mnt/user-data/outputs/";
+    path.starts_with(PREFIX)
+        && path.len() <= 4096
+        && !path.chars().any(char::is_control)
+        && !path.contains(['\\', '%', '#', '?'])
+        && path[PREFIX.len()..]
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+fn is_canonical_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.to_string() == value)
+}
+
+fn is_output_download_request(method: &Method, path: &str) -> bool {
+    if method.as_str() != "GET" {
+        return false;
+    }
+    let Some((route, query)) = path.split_once('?') else {
+        return false;
+    };
+    let Some(route) = route.strip_prefix("/api/organizations/") else {
+        return false;
+    };
+    let mut segments = route.split('/');
+    if !segments.next().is_some_and(is_canonical_uuid)
+        || !matches!(segments.next(), Some("conversations"))
+        || !segments.next().is_some_and(is_canonical_uuid)
+        || !matches!(segments.next(), Some("wiggle"))
+        || !matches!(segments.next(), Some("download-file"))
+        || segments.next().is_some()
+        || !query.starts_with("path=")
+        || query.contains('&')
+    {
+        return false;
+    }
+    let mut pairs = url::form_urlencoded::parse(query.as_bytes());
+    matches!(pairs.next(), Some((key, value)) if key.as_ref() == "path" && valid_output_path(value.as_ref()))
+        && pairs.next().is_none()
+}
+
 struct WebResponse {
     response: wreq::Response,
     span: Option<crate::observability::Span>,
@@ -175,6 +218,7 @@ impl WebClient {
         payload: Option<&Value>,
     ) -> Result<WebResponse> {
         lease.check().await?;
+        let allow_download_html = is_output_download_request(&method, path);
         let mode = if path.ends_with("/completion") {
             "sse"
         } else {
@@ -244,13 +288,12 @@ impl WebClient {
             .get("retry-after")
             .and_then(|h| h.to_str().ok())
             .map(str::to_owned);
-        if (300..400).contains(&status)
-            || response
-                .headers()
-                .get("content-type")
-                .and_then(|h| h.to_str().ok())
-                .is_some_and(|s| s.to_ascii_lowercase().starts_with("text/html"))
-        {
+        let html_response = response
+            .headers()
+            .get("content-type")
+            .and_then(|h| h.to_str().ok())
+            .is_some_and(|s| s.to_ascii_lowercase().starts_with("text/html"));
+        if (300..400).contains(&status) || (html_response && !allow_download_html) {
             if let Some(span) = &mut span {
                 span.finish(403);
             }
@@ -394,6 +437,106 @@ impl WebClient {
             Err(f) => Err(f),
             _ => Err(Fault::upstream()),
         }
+    }
+    pub async fn bind_project(
+        &self,
+        lease: &Lease,
+        scope: &Scope,
+        target: &str,
+        project: &str,
+    ) -> Result<()> {
+        let parsed_project = uuid::Uuid::parse_str(project)
+            .map_err(|_| Fault::invalid("invalid project binding identifier"))?;
+        if !is_canonical_uuid(target) || parsed_project.to_string() != project {
+            return Err(Fault::invalid("invalid project binding identifier"));
+        }
+        let org = self.organization(lease, scope).await?;
+        let path =
+            format!("/api/organizations/{org}/chat_conversations/{target}?rendering_mode=raw");
+        let payload = json!({"project_uuid":project});
+        let response = self
+            .request(
+                lease,
+                scope,
+                Method::PUT,
+                &path,
+                &format!("/chat/{target}"),
+                Some(&payload),
+            )
+            .await?;
+        let status = response.status().as_u16();
+        if matches!(status, 200 | 204) {
+            if status == 204 {
+                let mut response = response;
+                if let Some(span) = &mut response.span {
+                    span.finish(status);
+                }
+                return Ok(());
+            }
+            let _ = Self::decode(response, scope).await?;
+            return Ok(());
+        }
+        if let Some(mut span) = response.span {
+            span.finish(status);
+        }
+        Err(Fault::upstream())
+    }
+    pub async fn download_file(
+        &self,
+        lease: &Lease,
+        scope: &Scope,
+        target: &str,
+        path: &str,
+    ) -> Result<Vec<u8>> {
+        if !is_canonical_uuid(target) || !valid_output_path(path) {
+            return Err(Fault::invalid("invalid generated file path"));
+        }
+        let org = self.organization(lease, scope).await?;
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("path", path)
+            .finish();
+        let route =
+            format!("/api/organizations/{org}/conversations/{target}/wiggle/download-file?{query}");
+        let mut response = self
+            .request(
+                lease,
+                scope,
+                Method::GET,
+                &route,
+                &format!("/chat/{target}"),
+                None,
+            )
+            .await?;
+        let status = response.status().as_u16();
+        if status != 200 {
+            if let Some(span) = &mut response.span {
+                span.finish(status);
+            }
+            return Err(Fault::upstream());
+        }
+        let WebResponse { response, mut span } = response;
+        let result = async {
+            let mut stream = response.bytes_stream();
+            let mut body = Vec::new();
+            while let Some(chunk) = scope.wait(async { Ok(stream.next().await) }).await? {
+                lease.check().await?;
+                let chunk = chunk.map_err(|_| Fault::upstream())?;
+                if let Some(span) = &mut span {
+                    span.chunk(chunk.len());
+                }
+                if body.len().saturating_add(chunk.len()) > 32 << 20 {
+                    return Err(Fault::upstream());
+                }
+                body.extend_from_slice(&chunk);
+            }
+            lease.check().await?;
+            Ok(body)
+        }
+        .await;
+        if let Some(span) = &mut span {
+            span.finish(result.as_ref().err().map_or(200, |fault| fault.status));
+        }
+        result
     }
     pub async fn completion(
         &self,

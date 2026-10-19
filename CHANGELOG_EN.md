@@ -2,6 +2,13 @@
 
 [中文](CHANGELOG.md) · English · [Documentation index](DOCS.md)
 
+## v0.1.0-alpha.5 · 2026-10-19
+
+- Add native web search/fetch, Artifacts, remote code/files, 37 web widgets and explicitly selected project knowledge.
+- Preserve native tool results and citations across Messages, Chat and Responses; add expiring file downloads scoped to the API token.
+- Add separate console tool switches and alpha4-compatible persistence; improve continuation, cleanup and failure handling.
+- Update bilingual API, source-file and GHCR installation documentation. 148 tests, the release build and local upgrade/rollback acceptance passed; project knowledge has mock validation only.
+
 ## v0.1.0-alpha.4 · 2026-10-19
 
 - Reimplement Chat/Responses text adapters with role-preserving structured conversations and strict text validation.

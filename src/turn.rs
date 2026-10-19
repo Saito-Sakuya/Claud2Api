@@ -1,6 +1,7 @@
 use crate::{
     engine::{Engine, Output, Reservation},
     error::{Fault, Result},
+    native_stream::{WebBlockDecoder, WebEmission},
     protocol::{self, Block, Input, ToolDecoder, Turn},
     store::{Checkpoint, Usage, nonce, now},
     transport::CompletionRequest,
@@ -129,6 +130,13 @@ impl Engine {
         let target = if plan.fresh {
             let target = r.lease.slot.client.create(&r.lease, &r.scope).await?;
             self.own(&r.lease.account_id, &target).await?;
+            if let Some(project) = &r.input.project_uuid {
+                r.lease
+                    .slot
+                    .client
+                    .bind_project(&r.lease, &r.scope, &target, project)
+                    .await?;
+            }
             target
         } else {
             r.session.conversation_id.clone()
@@ -166,20 +174,22 @@ impl Engine {
                     parent,
                     model: &r.input.model,
                     prompt: &prompt,
-                    tools: json!([]),
+                    tools: crate::native_tools::descriptors(&r.input.native_tools),
                     thinking: "off",
                 },
             )
             .await?;
         let assistant = completion.assistant.clone();
         let mut decoder = ToolDecoder::new(&r.input, &protocol_nonce);
+        let mut web_decoder =
+            WebBlockDecoder::new(crate::native_tools::allowed_names(&r.input.native_tools));
         let mut blocks = Vec::new();
         let mut started = false;
         let mut generated = false;
         let mut reason = "end_turn".to_owned();
         let mut sequence = None;
         let mut raw_size = 0usize;
-        let mut thinking_size = 0usize;
+        let mut file_until = 0i64;
         let read = if r.settings.simulated_cache && !plan.fresh && r.session.cache_until > now() {
             r.session.cache_tokens.min(input_tokens)
         } else {
@@ -214,30 +224,62 @@ impl Engine {
                 .await?;
                 started = true;
             }
-            if kind == "content_block_delta" {
-                if !event["delta"].is_object() {
-                    return Err(Fault::upstream());
-                }
-                let text = event
-                    .pointer("/delta/text")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                raw_size += text.len();
-                thinking_size += event
-                    .pointer("/delta/thinking")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .len();
-                if raw_size > 8 << 20 || thinking_size > 8 << 20 {
-                    return Err(Fault::new(
-                        502,
-                        "api_error",
-                        "upstream output exceeds limit",
-                    ));
-                }
-                for block in decoder.feed(text)? {
-                    Self::send(&r.scope, tx, Output::Block(block.clone())).await?;
-                    protocol::merge_text(&mut blocks, block);
+            for emission in web_decoder.feed(&event)? {
+                match emission {
+                    WebEmission::Text(text) => {
+                        raw_size = raw_size.saturating_add(text.len());
+                        for block in decoder.feed(&text)? {
+                            Self::send(&r.scope, tx, Output::Block(block.clone())).await?;
+                            protocol::merge_text(&mut blocks, block);
+                        }
+                    }
+                    WebEmission::NativeStart(block) => {
+                        for text in decoder.boundary()? {
+                            Self::send(&r.scope, tx, Output::Block(text.clone())).await?;
+                            protocol::merge_text(&mut blocks, text);
+                        }
+                        Self::send(
+                            &r.scope,
+                            tx,
+                            Output::NativeStart(crate::native_tools::sanitize(block)),
+                        )
+                        .await?;
+                    }
+                    WebEmission::NativeDelta(delta) => {
+                        Self::send(
+                            &r.scope,
+                            tx,
+                            Output::NativeDelta(crate::native_tools::sanitize(delta)),
+                        )
+                        .await?;
+                    }
+                    WebEmission::NativeStop(block) => {
+                        let decorated = crate::native_files::decorate(
+                            crate::native_tools::sanitize(block),
+                            &self.config.gateway_key,
+                            &r.session.token_id,
+                            &r.lease.account_id,
+                            &target,
+                            r.settings.session_ttl_seconds.min(3600),
+                        )?;
+                        file_until = file_until.max(decorated.expires_at.unwrap_or(0));
+                        let block = decorated.block;
+                        raw_size = raw_size.saturating_add(protocol::go_json(&block).len());
+                        Self::send(&r.scope, tx, Output::NativeStop(block.clone())).await?;
+                        blocks.push(Block::Native { block });
+                    }
+                    WebEmission::Citation(citation) => {
+                        for text in decoder.boundary()? {
+                            Self::send(&r.scope, tx, Output::Block(text.clone())).await?;
+                            protocol::merge_text(&mut blocks, text);
+                        }
+                        let block = Block::Native {
+                            block: json!({"type":"citation","citation":crate::native_tools::sanitize(citation)}),
+                        };
+                        raw_size = raw_size.saturating_add(protocol::go_json(&block).len());
+                        Self::send(&r.scope, tx, Output::Block(block.clone())).await?;
+                        blocks.push(block);
+                    }
                 }
             }
             if kind == "message_delta" {
@@ -261,6 +303,7 @@ impl Engine {
             }
         }
         drop(completion);
+        web_decoder.finish()?;
         for block in decoder.finish()? {
             Self::send(&r.scope, tx, Output::Block(block.clone())).await?;
             protocol::merge_text(&mut blocks, block);
@@ -308,7 +351,11 @@ impl Engine {
         self.store.mutate(event,json!({"session_id":r.session.id,"account_id":r.lease.account_id,"model":r.input.model}),|state|{
             let old=state.sessions.get(&r.session.id).cloned().ok_or_else(Fault::internal)?;
             if old.conversation_id!=target{state.queue(&old.account_id,&old.conversation_id);}
-            state.pending.retain(|j|!(j.account_id==r.lease.account_id&&j.conversation_id==target));
+            state.pending.retain(|j|!(j.account_id==r.lease.account_id&&j.conversation_id==target&&j.next_attempt<=now()));
+            if file_until>now(){
+                state.queue(&r.lease.account_id,&target);
+                if let Some(job)=state.pending.iter_mut().find(|j|j.account_id==r.lease.account_id&&j.conversation_id==target){job.next_attempt=job.next_attempt.max(file_until);}
+            }
             let current=state.sessions.get_mut(&r.session.id).ok_or_else(Fault::internal)?;
             current.account_id=r.lease.account_id.clone();
             current.conversation_id=target;

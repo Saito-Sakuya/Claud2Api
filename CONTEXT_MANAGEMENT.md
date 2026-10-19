@@ -51,7 +51,7 @@ only initialize a new state directory.
    issues and next steps. The original system and tool definitions are retained
    word for word separately from the summary.
 2. Disable native tools/thinking for this internal operation. No tools are
-   executed by the gateway. The handoff never enters the client's business
+   executed during summarization. The handoff never enters the client's business
    response. It targets roughly 2000 estimated tokens and is capped at 8192 bytes;
    invalid, truncated or oversized output is rejected. Summarization is lossy.
 3. Require meaningful estimated context reduction and keep protected checkpoint

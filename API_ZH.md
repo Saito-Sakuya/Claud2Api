@@ -119,8 +119,54 @@ with client.messages.stream(
 工具结果也可以是文本块数组。工具参数及结果中的语义数据保持原样。
 工具声明需包含 name、description（可选）及对象类型的 `input_schema`，支持本地 JSON Schema 引用，
 不加载远程或文件引用。`tool_choice` 支持 auto、none、any、tool（指定名称）及 `disable_parallel_tool_use`。
-本服务不执行工具；客户端执行后，携带完整历史及 user 的 tool_result 继续请求。
-模型生成的工具参数不合法或违背强制工具选择时返回错误，不伪造工具结果。
+自定义客户端工具由客户端执行；调用结果放入后续 user 的 `tool_result`。模型生成的参数不合法或违背
+强制工具选择时返回错误，不伪造客户端工具结果。
+
+### Claude 网页原生工具（Claud2Api 扩展）
+
+Messages 可在 Claude 网页会话中启用以下远端工具组：网页搜索与读取 `web_search`、Artifacts `artifacts`、
+代码与文件沙箱 `repl`，以及网页信息与交互卡片 `widgets`。省略 `claud2api_tools` 时采用运行配置中已开启的
+工具组；传入数组可按请求选择子集，空数组 `[]` 表示关闭。请求了管理员已关闭的组会在分配账号前返回 400。
+标准 `tools`／`tool_choice` 只控制客户端工具，不会关闭或选择这些原生工具组。
+`widgets` 包含当前网页端的 37 种组件，包括询问用户、信息卡片、授权提示和排程展示。它们作为网页组件数据原样返回；
+网关不提供组件的用户回复回传流程，不会替用户授予授权、连接 MCP 或执行排程操作。具体组件仍由上游账号能力决定。
+
+```json
+{
+  "model": "claude-sonnet-5-5",
+  "max_tokens": 1024,
+  "claud2api_tools": ["web_search"],
+  "messages": [{"role":"user","content":"搜索 Claude 官方网页并概述结果。"}]
+}
+```
+
+工具在 Claude 远端环境中执行，Claud2Api 不会在网关主机运行模型给出的命令。完整调用与结果以
+`claud2api_native` 扩展块返回；其中 `block` 保留上游的 `tool_use` 或 `tool_result` 对象，原生错误保留在结果的
+`is_error` 中。工具 input 与结构化结果保持原样；扩展会移除上游授权键及 MCP 服务端地址等控制元数据。
+客户端应把返回的 assistant `content` 数组原样放回完整历史，不要另造 `tool_result`。下一次请求会验证并保留这些块，
+会话指纹也会记录启用的工具组。
+
+引用同样使用 `claud2api_native` 扩展块：`block.type` 为 `citation`，其 `block.citation` 包含 `text_block_index`、`start_index`、
+`end_index`、`cited_text` 和可用的来源字段。偏移按原始文本块的 Unicode 字符计数。来源对象是网页会话的元数据，
+与官方 API 的加密引用格式不同。官方日期版本的 API 服务端工具块仍不支持；请使用 `claud2api_tools`。
+自定义 MCP 连接器、连接器授权执行和排程执行不在此扩展范围内；实际可用工具由上游账号权限决定。
+
+项目知识搜索可通过 `claud2api_project_uuid` 绑定一个已知项目。该值必须是规范的小写 UUID；网关不会列出或读取账号的全部私有项目，
+上游账号仍须有该项目的访问权限。提供 UUID 且管理员已开启项目知识时，省略 `claud2api_tools` 会在默认四组之外加入 `project_knowledge`；
+也可在数组中明确选择它。没有 UUID 时显式请求 `project_knowledge` 返回 400。管理员关闭项目知识后，任何项目 UUID 都会被拒绝，
+即使 `claud2api_tools` 是空数组。项目 ID 和工具组参与会话指纹；Messages 配置变化会建立新的上游会话，调用方应继续发送完整支持历史。
+
+```json
+{
+  "claud2api_project_uuid": "<替换为有权访问的规范小写项目 UUID>",
+  "claud2api_tools": ["project_knowledge"]
+}
+```
+
+Messages、Chat 和 Responses 的生成文件结果中，`tool_result.content` 的 `local_resource` 或 `tool_result.structured_content`
+如含有输出路径，网关会在对应对象上附加 `claud2api_download_url`。使用响应中的链接通过
+`GET /v1/native-files/{opaque-handle}` 下载，必须带生成链接时使用的同一凭证（API 令牌或网关密钥）。
+链接经过加密并绑定令牌所有者，最多有效 1 小时；下载上限 32 MiB，响应强制作为附件下载。链接失效前服务会保留对应的上游会话。
 
 Claude Code 兼容：顶层 `system` 开头符合已知格式的 `x-anthropic-billing-header` 归因行，
 会在上下文哈希、网页提示词投影和本地输入估算前移除。支持独立的首个文本块，或合并文本块／字符串
@@ -168,12 +214,15 @@ usage 为本地字符估算，模拟缓存字段不等于真实缓存命中、�
 ## 响应与 SSE
 
 Messages JSON 包含 id、type、role、content、model、stop_reason、stop_sequence、usage。
-工具调用时 stop_reason 为 tool_use。SSE 使用 `event: <type>` 与 `data: <JSON>`，包括
+客户端工具调用时 stop_reason 为 tool_use；原生网页工具在同一轮远端执行并返回结果块。
+SSE 使用 `event: <type>` 与 `data: <JSON>`，包括
 message_start、content_block_start / delta / stop、message_delta、message_stop，等待期间可发送 ping。
-工具参数增量为 input_json_delta，在完整参数校验后发送。中断或错误使用 error 终止，不伪装成功。
+客户端工具参数增量为 input_json_delta，在完整参数校验后发送。原生工具使用 `claud2api_native_delta`，
+其增量封装上游原始 delta；对应 `content_block_stop` 附带完整 `claud2api_block`，客户端应以它替换该块。
+中断或错误使用 error 终止，不伪装成功。
 
 `X-Request-ID` 关联脱敏日志；日志保留客户端原始 model 参数和令牌记录 ID，不保存完整令牌、聊天正文或摘要。
-`X-Claud2Api-Limitations` 声明用量估算、max_tokens 建议值、文本工具桥接及不转发控制字段等限制。
+`X-Claud2Api-Limitations` 声明用量估算、max_tokens 建议值、文本客户端工具桥接、原生网页工具扩展及不转发控制字段等限制。
 
 ## 调度与错误
 
@@ -206,12 +255,18 @@ message_start、content_block_start / delta / stop、message_delta、message_sto
 
 兼容提供 `POST /v1/chat/completions`、`POST /v1/responses`、`GET /v1/models` 和
 `DELETE /v1/conversations/{conversation_id}`。Chat 使用 messages 文本，Responses 使用 input 文本或有序文本消息及可选 instructions。
-字符串和支持的文本块会保留原角色；非文本块和未支持的工具调用会被拒绝，不再默认启用网页原生工具。
+字符串和支持的文本块会保留原角色；兼容接口不接受客户端工具定义及工具历史，但可通过 `claud2api_tools` 请求网页原生工具。
+Chat 和 Responses 返回 `claud2api_native`、`claud2api_citations` 扩展字段；Chat SSE 和 Responses SSE 另有
+`claud2api.native_start`、`claud2api.native_delta`、`claud2api.native_stop` 与 `claud2api.citation` 扩展事件。
+Responses 只在来源文本能唯一匹配时生成标准 `url_citation` 标注。
+兼容接口的输入保持文本结构；虽然响应包含原生工具扩展，后续请求不能回传这些结构块。需要保留原生调用与结果历史时请使用 Messages。
 均可 stream。用量按实际桥接提示和输出统一进行字符估算，合计等于输入加输出；Chat 流可用
 `stream_options.include_usage` 在成功结束时获取独立用量帧。Chat 流失败返回结构化错误，不把错误塞进回答或以成功 stop 结束。
 Responses 使用带序号的命名 SSE 事件，以 `response.completed` 或 `response.failed` 终止。
 兼容接口可用 conversation_id 复用本进程内会话映射，删除仅限当前令牌拥有的映射，重启后此映射不保留，也不共享 Messages 的自动压缩和额度迁移。
 此扩展把每次提交作为后续消息追加，因此设置 conversation_id 时只发送新增消息。
+同一 `conversation_id` 必须保持相同的 `claud2api_tools` 和 `claud2api_project_uuid`；更改任一项会在访问上游前返回 409。
+保留原配置继续请求，或用新的 `conversation_id` 开始会话。
 每轮发送完整历史的客户端应省略该字段；文本兼容接口不对历史去重。
 Messages 的持久粘性会话不依赖旧接口的删除路径。
 未实现 count_tokens、批量任务及其他官方 API 功能，未知路径返回结构化 404。

@@ -129,8 +129,13 @@ fn event(value: Value) -> String {
 }
 fn text_events(text: &str) -> String {
     event(json!({"type":"message_start"}))
-        + &event(json!({"type":"content_block_start","content_block":{"type":"text","text":""}}))
-        + &event(json!({"type":"content_block_delta","delta":{"type":"text_delta","text":text}}))
+        + &event(
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        )
+        + &event(
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}),
+        )
+        + &event(json!({"type":"content_block_stop","index":0}))
         + &event(json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}))
         + &event(json!({"type":"message_stop"}))
 }
@@ -144,7 +149,8 @@ async fn mock(State(state): State<Arc<Upstream>>, request: Request) -> Response 
     let json_body = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
     state.traces.lock().await.push(json!({"method":method,"uri":path,"body":json_body,"cookie":headers.get("cookie").and_then(|v|v.to_str().ok()),"headers":headers.iter().map(|(k,v)|(k.as_str().to_owned(),Value::String(v.to_str().unwrap_or("").to_owned()))).collect::<serde_json::Map<_,_>>()}));
     if path == "/api/organizations" {
-        return axum::Json(json!([{"uuid":"org-test"}])).into_response();
+        return axum::Json(json!([{"uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}]))
+            .into_response();
     }
     if path.starts_with("/edge-api/") {
         let status = state.catalog_status.load(Ordering::SeqCst);
@@ -172,6 +178,20 @@ async fn mock(State(state): State<Arc<Upstream>>, request: Request) -> Response 
     if method == "DELETE" {
         state.deleted.fetch_add(1, Ordering::SeqCst);
         return StatusCode::NO_CONTENT.into_response();
+    }
+    if method == "PUT"
+        && path.starts_with(
+            "/api/organizations/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/chat_conversations/",
+        )
+    {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    if method == "GET"
+        && path
+            .starts_with("/api/organizations/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/conversations/")
+        && path.contains("/wiggle/download-file?")
+    {
+        return ([("content-type", "text/html")], "name,value\nexample,42\n").into_response();
     }
     if path.ends_with("/chat_conversations") {
         state.created.fetch_add(1, Ordering::SeqCst);
@@ -252,6 +272,114 @@ async fn mock(State(state): State<Arc<Upstream>>, request: Request) -> Response 
 fn base() -> Value {
     json!({"model":"test","max_tokens":128,"messages":[{"role":"user","content":"hello"}]})
 }
+fn default_native_descriptors() -> Value {
+    let mut descriptors = vec![
+        json!({"type":"web_search_v0","name":"web_search"}),
+        json!({"type":"artifacts_v0","name":"artifacts"}),
+        json!({"type":"repl_v0","name":"repl"}),
+        json!({"type":"send_to_user_v0","name":"send_to_user"}),
+    ];
+    let widgets = [
+        "weather_fetch",
+        "display_stock_data",
+        "recipe_display_v0",
+        "places_search",
+        "places_search_v1",
+        "places_map_display_v0",
+        "places_map_display_v1",
+        "message_compose_v1",
+        "writing_draft_v0",
+        "ask_user_input_v0",
+        "ask_user_free_form_input_v0",
+        "fetch_sports_data",
+        "recommend_claude_apps",
+        "show_recommendation_cards",
+        "quiz_display_v0",
+        "storyboard_v0",
+        "chart_display_v0",
+        "options_card_display_v0",
+        "step_card_display_v0",
+        "itinerary_display_v0",
+        "translation_display_v0",
+        "comparison_card_display_v0",
+        "featured_card_display_v0",
+        "product_carousel_display_v0",
+        "link_preview_display_v0",
+        "places_list_display_v0",
+        "starter_tasks_display_v0",
+        "claude_code_install_display_v0",
+        "role_select_display_v0",
+        "approved_connectors_display_v0",
+        "persona_cards_display_v0",
+        "email_consent_prompt_v0",
+        "insight_widget_v0",
+        "prompts_card_display_v0",
+        "source_card_display_v0",
+        "offer_next_step_v0",
+        "offer_schedule_v0",
+    ];
+    descriptors.extend(
+        widgets
+            .iter()
+            .map(|name| json!({"type":"widget","name":name})),
+    );
+    json!(descriptors)
+}
+fn native_search_events() -> String {
+    [
+        json!({"type":"message_start"}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu-search-1","name":"web_search","input":{},"tool_origin":"first_party","approval_key":"synthetic-control-value"}}),
+        json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"que"}}),
+        json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"ry\":\"example\"}"}}),
+        json!({"type":"content_block_delta","index":1,"delta":{"type":"tool_use_block_update_delta","tool_use_id":"toolu-search-1","message":"Searching","display_content":"Searching"}}),
+        json!({"type":"content_block_stop","index":1}),
+        json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_result","tool_use_id":"toolu-search-1","name":"web_search","content":[{"type":"knowledge","title":"Example","url":"https://example.com/source","metadata":{"type":"web","site_name":"Example"}}],"is_error":false}}),
+        json!({"type":"content_block_stop","index":2}),
+        json!({"type":"content_block_start","index":3,"content_block":{"type":"text","text":"","citations":[]}}),
+        json!({"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"甲"}}),
+        json!({"type":"content_block_delta","index":3,"delta":{"type":"citation_start_delta","citation":{"uuid":"citation-1","type":"web_search_result_location","title":"Example Source","url":"https://example.com/source","metadata":{"site_name":"Example"}}}}),
+        json!({"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"乙丙"}}),
+        json!({"type":"content_block_delta","index":3,"delta":{"type":"citation_end_delta","citation_uuid":"citation-1"}}),
+        json!({"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"丁结论。"}}),
+        json!({"type":"content_block_stop","index":3}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+        json!({"type":"message_limit","message_limit":{"type":"turn"}}),
+        json!({"type":"message_stop"}),
+    ]
+    .into_iter()
+    .map(event)
+    .collect::<Vec<_>>()
+    .concat()
+}
+fn native_file_events() -> String {
+    [
+        json!({"type":"message_start"}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu-present-1","name":"present_files","input":{}}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"files\":[\"/mnt/user-data/outputs/report.csv\"]}"}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_result","tool_use_id":"toolu-present-1","name":"present_files","content":[{"type":"local_resource","file_path":"/mnt/user-data/outputs/report.csv","name":"report.csv","mime_type":"text/csv"}],"is_error":false}}),
+        json!({"type":"content_block_stop","index":1}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+        json!({"type":"message_stop"}),
+    ]
+    .into_iter()
+    .map(event)
+    .collect::<Vec<_>>()
+    .concat()
+}
+fn single_native_search_descriptor() -> Value {
+    json!([{"type":"web_search_v0","name":"web_search"}])
+}
+fn project_native_descriptors() -> Value {
+    let mut descriptors = default_native_descriptors();
+    descriptors
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"project_knowledge_search","name":"project_knowledge_search"}));
+    descriptors
+}
 fn normalize_generated(value: &mut Value) {
     match value {
         Value::Object(object) => {
@@ -299,6 +427,926 @@ fn sse_values(text: &str) -> Value {
     }
     json!(values)
 }
+fn completion_requests(traces: &[Value]) -> Vec<Value> {
+    traces
+        .iter()
+        .filter(|trace| trace["uri"].as_str().unwrap().ends_with("/completion"))
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn native_tool_selection_forwards_descriptors_and_honors_admin_caps() {
+    let f = fixture(1).await;
+    let (_, settings) = admin(&f.engine, "GET", "/settings", Value::Null, None).await;
+    for group in [
+        "native_web_search",
+        "native_artifacts",
+        "native_repl",
+        "native_widgets",
+        "native_project_knowledge",
+    ] {
+        assert_eq!(settings["settings"][group], true, "{group}");
+    }
+
+    let mut selected = base();
+    selected["claud2api_tools"] = json!(["web_search"]);
+    let (status, _, body) =
+        call(&f.engine, "/v1/messages", selected, Some("native-selected")).await;
+    assert_eq!(status, 200, "{body}");
+    let traces = f.upstream.traces.lock().await;
+    assert_eq!(
+        completion_requests(&traces)[0]["body"]["tools"],
+        single_native_search_descriptor()
+    );
+    drop(traces);
+
+    reset_pacing(&f.engine).await;
+    let mut disabled = base();
+    disabled["claud2api_tools"] = json!([]);
+    let (status, _, body) =
+        call(&f.engine, "/v1/messages", disabled, Some("native-disabled")).await;
+    assert_eq!(status, 200, "{body}");
+    let traces = f.upstream.traces.lock().await;
+    assert_eq!(completion_requests(&traces)[1]["body"]["tools"], json!([]));
+
+    let f = fixture(1).await;
+    f.engine
+        .store
+        .mutate("", json!({}), |state| {
+            state.settings.native_web_search = false;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let mut forbidden = base();
+    forbidden["claud2api_tools"] = json!(["web_search"]);
+    let (status, _, body) = call(&f.engine, "/v1/messages", forbidden, None).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(f.upstream.traces.lock().await.is_empty());
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 0);
+
+    let f = fixture(1).await;
+    let mut project_without_uuid = base();
+    project_without_uuid["claud2api_tools"] = json!(["project_knowledge"]);
+    let (status, _, body) = call(&f.engine, "/v1/messages", project_without_uuid, None).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(f.upstream.traces.lock().await.is_empty());
+
+    f.engine
+        .store
+        .mutate("", json!({}), |state| {
+            state.settings.native_project_knowledge = false;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let mut disabled_project = base();
+    disabled_project["claud2api_project_uuid"] = json!("11111111-1111-4111-8111-111111111111");
+    disabled_project["claud2api_tools"] = json!([]);
+    let (status, _, body) = call(&f.engine, "/v1/messages", disabled_project, None).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(f.upstream.traces.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn messages_native_blocks_preserve_lifecycle_and_stream_the_same_final_blocks() {
+    let json_fixture = fixture(1).await;
+    json_fixture
+        .upstream
+        .replies
+        .lock()
+        .await
+        .push_back(Reply::Raw(native_search_events()));
+    let (status, headers, body) = call(
+        &json_fixture.engine,
+        "/v1/messages",
+        base(),
+        Some("native-json"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["stop_reason"], "end_turn");
+    assert_eq!(body["content"][0]["type"], "claud2api_native");
+    assert_eq!(body["content"][0]["block"]["type"], "tool_use");
+    assert_eq!(
+        body["content"][0]["block"]["input"],
+        json!({"query":"example"})
+    );
+    assert_eq!(body["content"][0]["block"]["message"], "Searching");
+    assert_eq!(body["content"][1]["block"]["type"], "tool_result");
+    assert_eq!(
+        body["content"][1]["block"]["content"][0]["type"],
+        "knowledge"
+    );
+    assert_eq!(body["content"][2]["type"], "text");
+    assert_eq!(body["content"][2]["text"], "甲乙丙");
+    assert_eq!(body["content"][3]["type"], "claud2api_native");
+    assert_eq!(body["content"][3]["block"]["type"], "citation");
+    assert_eq!(body["content"][3]["block"]["citation"]["start_index"], 1);
+    assert_eq!(body["content"][3]["block"]["citation"]["end_index"], 3);
+    assert_eq!(
+        body["content"][3]["block"]["citation"]["cited_text"],
+        "乙丙"
+    );
+    assert_eq!(body["content"][4]["type"], "text");
+    assert_eq!(body["content"][4]["text"], "丁结论。");
+    assert!(
+        body["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| { !matches!(block["type"].as_str(), Some("tool_use" | "tool_result")) })
+    );
+    assert!(!body.to_string().contains("synthetic-control-value"));
+    let traces = json_fixture.upstream.traces.lock().await;
+    let upstream_calls = completion_requests(&traces);
+    assert_eq!(
+        upstream_calls[0]["body"]["tools"],
+        default_native_descriptors()
+    );
+    let prompt = upstream_calls[0]["body"]["prompt"].as_str().unwrap();
+    let envelope: Value = serde_json::from_str(prompt.lines().last().unwrap()).unwrap();
+    assert_eq!(envelope["client_tools"], json!([]));
+    assert_eq!(
+        envelope["native_tools"],
+        json!(["web_search", "artifacts", "repl", "widgets"])
+    );
+    drop(traces);
+    let session_id = headers["x-c2a-session-id"].to_str().unwrap();
+    let session = json_fixture
+        .engine
+        .store
+        .read()
+        .await
+        .sessions
+        .get(session_id)
+        .unwrap()
+        .clone();
+    assert_eq!(session.history.len(), 2);
+
+    let stream_fixture = fixture(1).await;
+    stream_fixture
+        .upstream
+        .replies
+        .lock()
+        .await
+        .push_back(Reply::Raw(native_search_events()));
+    let mut request = base();
+    request["stream"] = json!(true);
+    request["claud2api_tools"] = json!(["web_search"]);
+    let (status, _, wire) = call(
+        &stream_fixture.engine,
+        "/v1/messages",
+        request,
+        Some("native-stream"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let events = sse_values(wire.as_str().unwrap());
+    let events = events.as_array().unwrap();
+    let tool_start = events
+        .iter()
+        .find(|event| {
+            event["type"] == "content_block_start"
+                && event["content_block"]["type"] == "claud2api_native"
+                && event["content_block"]["block"]["type"] == "tool_use"
+        })
+        .unwrap();
+    assert_eq!(tool_start["content_block"]["block"]["input"], json!({}));
+    assert!(events.iter().any(|event| {
+        event["type"] == "content_block_delta"
+            && event["delta"]["type"] == "claud2api_native_delta"
+            && event["delta"]["delta"]["type"] == "input_json_delta"
+    }));
+    let tool_stop = events
+        .iter()
+        .find(|event| {
+            event["type"] == "content_block_stop"
+                && event["claud2api_block"]["block"]["type"] == "tool_use"
+        })
+        .unwrap();
+    assert_eq!(tool_stop["claud2api_block"], body["content"][0]);
+    let result_stop = events
+        .iter()
+        .find(|event| {
+            event["type"] == "content_block_stop"
+                && event["claud2api_block"]["block"]["type"] == "tool_result"
+        })
+        .unwrap();
+    assert_eq!(result_stop["claud2api_block"], body["content"][1]);
+    let text_block_indexes: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "content_block_start" && event["content_block"]["type"] == "text"
+        })
+        .map(|event| event["index"].as_u64().unwrap())
+        .collect();
+    let text_deltas = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "content_block_delta" && event["delta"]["type"] == "text_delta"
+        })
+        .filter_map(|event| event["delta"]["text"].as_str())
+        .collect::<String>();
+    assert_eq!(text_block_indexes, vec![2, 4]);
+    assert_eq!(text_deltas, "甲乙丙丁结论。");
+    assert!(events.iter().any(|event| {
+        event["type"] == "content_block_start"
+            && event["content_block"]["block"]["type"] == "citation"
+    }));
+}
+
+#[tokio::test]
+async fn compat_adapters_return_native_extensions_and_stream_extension_events() {
+    for responses in [false, true] {
+        for stream in [false, true] {
+            let f = fixture(1).await;
+            f.upstream
+                .replies
+                .lock()
+                .await
+                .push_back(Reply::Raw(native_search_events()));
+            let path = if responses {
+                "/v1/responses"
+            } else {
+                "/v1/chat/completions"
+            };
+            let mut request =
+                json!({"model":"test","stream":stream,"claud2api_tools":["web_search"]});
+            if responses {
+                request["input"] = json!("请用搜索验证这个来源。");
+            } else {
+                request["messages"] = json!([{"role":"user","content":"请用搜索验证这个来源。"}]);
+            }
+            let (status, _, output) = call(&f.engine, path, request, None).await;
+            assert_eq!(status, 200, "{path} stream={stream}: {output}");
+            let traces = f.upstream.traces.lock().await;
+            assert_eq!(
+                completion_requests(&traces)[0]["body"]["tools"],
+                single_native_search_descriptor()
+            );
+            drop(traces);
+
+            if !stream {
+                assert_eq!(output["claud2api_native"].as_array().unwrap().len(), 2);
+                assert_eq!(output["claud2api_native"][0]["type"], "tool_use");
+                assert_eq!(output["claud2api_native"][1]["type"], "tool_result");
+                assert_eq!(output["claud2api_citations"][0]["cited_text"], "乙丙");
+                if responses {
+                    assert_eq!(output["output"][0]["content"][0]["text"], "甲乙丙丁结论。");
+                    assert_eq!(
+                        output["output"][0]["content"][0]["annotations"][0]["start_index"],
+                        1
+                    );
+                    assert_eq!(
+                        output["output"][0]["content"][0]["annotations"][0]["end_index"],
+                        3
+                    );
+                } else {
+                    assert_eq!(output["choices"][0]["message"]["content"], "甲乙丙丁结论。");
+                }
+            } else {
+                let wire = output.as_str().unwrap();
+                assert!(wire.contains("event: claud2api.native_start"));
+                assert!(wire.contains("event: claud2api.native_delta"));
+                assert!(wire.contains("event: claud2api.native_stop"));
+                assert!(wire.contains("event: claud2api.citation"));
+                let events = sse_values(wire);
+                let events = events.as_array().unwrap();
+                if responses {
+                    assert!(
+                        events
+                            .iter()
+                            .any(|event| event["type"] == "claud2api.native_start")
+                    );
+                    let completed = events
+                        .iter()
+                        .find(|event| event["type"] == "response.completed")
+                        .unwrap();
+                    assert_eq!(
+                        completed["response"]["claud2api_native"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        2
+                    );
+                    assert_eq!(
+                        completed["response"]["claud2api_citations"][0]["cited_text"],
+                        "乙丙"
+                    );
+                    assert_eq!(
+                        completed["response"]["output"][0]["content"][0]["annotations"][0]["url"],
+                        "https://example.com/source"
+                    );
+                } else {
+                    let final_chunk = events
+                        .iter()
+                        .find(|event| event["choices"][0]["finish_reason"] == "stop")
+                        .unwrap();
+                    assert_eq!(final_chunk["claud2api_native"].as_array().unwrap().len(), 2);
+                    assert_eq!(final_chunk["claud2api_citations"][0]["cited_text"], "乙丙");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_blocks_roundtrip_in_messages_history_without_recreating_conversation() {
+    let f = fixture(1).await;
+    f.upstream.replies.lock().await.extend([
+        Reply::Raw(native_search_events()),
+        Reply::Text("continued".to_owned()),
+    ]);
+    let (status, headers, first) =
+        call(&f.engine, "/v1/messages", base(), Some("native-history")).await;
+    assert_eq!(status, 200, "{first}");
+    let session_id = headers["x-c2a-session-id"].to_str().unwrap().to_owned();
+    reset_pacing(&f.engine).await;
+    let mut next = base();
+    next["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":first["content"]}),
+        json!({"role":"user","content":"continue after the native search"}),
+    ]);
+    let (status, response_headers, second) =
+        call(&f.engine, "/v1/messages", next.clone(), Some(&session_id)).await;
+    assert_eq!(status, 200, "{second}");
+    assert_eq!(response_headers["x-c2a-session-id"], session_id);
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 1);
+    next["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"assistant","content":second["content"]}));
+    next["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"history hash sentinel"}));
+    let expected_history = protocol::parse(&next)
+        .unwrap()
+        .hashes(&f.engine.config.gateway_key);
+    let state = f.engine.store.read().await;
+    let session = state.sessions.get(&session_id).unwrap();
+    assert_eq!(
+        session.history,
+        expected_history[..expected_history.len() - 1]
+    );
+    assert_eq!(session.history.len(), 4);
+    drop(state);
+    let traces = f.upstream.traces.lock().await;
+    let calls = completion_requests(&traces);
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["uri"], calls[1]["uri"]);
+    assert_eq!(
+        calls[1]["body"]["parent_message_uuid"],
+        calls[0]["body"]["turn_message_uuids"]["assistant_message_uuid"]
+    );
+    assert_eq!(calls[0]["body"]["tools"], default_native_descriptors());
+    assert_eq!(calls[1]["body"]["tools"], default_native_descriptors());
+    assert!(
+        calls[1]["body"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("continue after the native search")
+    );
+    assert!(
+        !calls[1]["body"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("toolu-search-1")
+    );
+}
+
+#[tokio::test]
+async fn explicit_project_is_bound_before_completion_and_part_of_session_context() {
+    let f = fixture(1).await;
+    f.upstream.replies.lock().await.extend([
+        Reply::Text("first project answer".to_owned()),
+        Reply::Text("same project continuation".to_owned()),
+        Reply::Text("changed project answer".to_owned()),
+    ]);
+    let project_a = "11111111-1111-4111-8111-111111111111";
+    let project_b = "22222222-2222-4222-8222-222222222222";
+    let mut first_request = base();
+    first_request["claud2api_project_uuid"] = json!(project_a);
+    let (status, headers, first) = call(
+        &f.engine,
+        "/v1/messages",
+        first_request,
+        Some("project-context"),
+    )
+    .await;
+    assert_eq!(status, 200, "{first}");
+    let handle = headers["x-c2a-session-id"].to_str().unwrap().to_owned();
+    let first_context = f.engine.store.read().await.sessions[&handle]
+        .context_hash
+        .clone();
+
+    reset_pacing(&f.engine).await;
+    let mut same_project = base();
+    same_project["claud2api_project_uuid"] = json!(project_a);
+    same_project["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":first["content"]}),
+        json!({"role":"user","content":"continue with this project"}),
+    ]);
+    let (status, _, second) = call(
+        &f.engine,
+        "/v1/messages",
+        same_project.clone(),
+        Some(&handle),
+    )
+    .await;
+    assert_eq!(status, 200, "{second}");
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.engine.store.read().await.sessions[&handle].context_hash,
+        first_context
+    );
+
+    reset_pacing(&f.engine).await;
+    same_project["claud2api_project_uuid"] = json!(project_b);
+    same_project["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":second["content"]}),
+        json!({"role":"user","content":"switch the project"}),
+    ]);
+    let (status, _, third) = call(&f.engine, "/v1/messages", same_project, Some(&handle)).await;
+    assert_eq!(status, 200, "{third}");
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 2);
+    assert_ne!(
+        f.engine.store.read().await.sessions[&handle].context_hash,
+        first_context
+    );
+
+    let traces = f.upstream.traces.lock().await;
+    let bindings: Vec<_> = traces
+        .iter()
+        .enumerate()
+        .filter(|(_, trace)| {
+            trace["method"] == "PUT"
+                && trace["uri"].as_str().is_some_and(|uri| {
+                    uri.contains("/chat_conversations/") && uri.contains("rendering_mode=raw")
+                })
+        })
+        .collect();
+    let calls: Vec<_> = completion_requests(&traces);
+    assert_eq!(bindings.len(), 2);
+    assert_eq!(calls.len(), 3);
+    assert_eq!(bindings[0].1["body"]["project_uuid"], project_a);
+    assert_eq!(bindings[1].1["body"]["project_uuid"], project_b);
+    for (binding, completion_index) in bindings.iter().zip([0, 2]) {
+        assert!(
+            binding.0
+                < traces
+                    .iter()
+                    .position(|trace| trace["uri"] == calls[completion_index]["uri"])
+                    .unwrap()
+        );
+        let bound_conversation = binding.1["uri"]
+            .as_str()
+            .unwrap()
+            .split('?')
+            .next()
+            .unwrap();
+        let completed_conversation = calls[completion_index]["uri"]
+            .as_str()
+            .unwrap()
+            .strip_suffix("/completion")
+            .unwrap();
+        assert_eq!(bound_conversation, completed_conversation);
+    }
+    assert_eq!(calls[0]["body"]["tools"], project_native_descriptors());
+    assert_eq!(calls[1]["body"]["tools"], project_native_descriptors());
+    assert_eq!(calls[2]["body"]["tools"], project_native_descriptors());
+    let first_prompt = calls[0]["body"]["prompt"].as_str().unwrap();
+    let first_envelope: Value = serde_json::from_str(first_prompt.lines().last().unwrap()).unwrap();
+    assert_eq!(first_envelope["project_uuid"], project_a);
+    assert_eq!(
+        first_envelope["native_tools"],
+        json!([
+            "web_search",
+            "artifacts",
+            "repl",
+            "widgets",
+            "project_knowledge"
+        ])
+    );
+    assert_eq!(calls[0]["uri"], calls[1]["uri"]);
+    assert_ne!(calls[1]["uri"], calls[2]["uri"]);
+}
+
+#[tokio::test]
+async fn native_tool_errors_after_generation_do_not_commit_or_retry() {
+    let cases = [
+        (
+            "malformed_input",
+            vec![
+                json!({"type":"message_start"}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu-bad-json","name":"web_search","input":{}}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"not json"}}),
+                json!({"type":"content_block_stop","index":0}),
+            ],
+            json!(["web_search"]),
+        ),
+        (
+            "unallowed_tool",
+            vec![
+                json!({"type":"message_start"}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu-disabled","name":"repl","input":{}}}),
+            ],
+            json!(["web_search"]),
+        ),
+        (
+            "truncated_tool",
+            vec![
+                json!({"type":"message_start"}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu-truncated","name":"web_search","input":{}}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"example\"}"}}),
+            ],
+            json!(["web_search"]),
+        ),
+    ];
+    for (case, events, groups) in cases {
+        let f = fixture(2).await;
+        let wire = events.into_iter().map(event).collect::<Vec<_>>().concat();
+        f.upstream.replies.lock().await.extend([
+            Reply::Raw(wire),
+            Reply::Text("must not be replayed".to_owned()),
+        ]);
+        let mut request = base();
+        request["claud2api_tools"] = groups;
+        let (status, headers, body) = call(&f.engine, "/v1/messages", request, Some(case)).await;
+        assert_eq!(status, 502, "{case}: {body}");
+        assert_eq!(f.upstream.created.load(Ordering::SeqCst), 1, "{case}");
+        assert_eq!(f.upstream.replies.lock().await.len(), 1, "{case}");
+        let state = f.engine.store.read().await;
+        assert!(
+            state
+                .sessions
+                .values()
+                .all(|session| session.history.is_empty() && !session.active),
+            "{case}"
+        );
+        assert!(
+            state
+                .pending
+                .iter()
+                .any(|item| !item.conversation_id.is_empty()),
+            "{case}"
+        );
+        assert!(headers.get("x-c2a-session-id").is_none(), "{case}");
+    }
+}
+
+#[tokio::test]
+async fn native_file_links_are_token_scoped_and_return_sandboxed_attachments() {
+    let f = fixture(1).await;
+    let (_, owner_key) = managed_token(&f.engine, 3).await;
+    let (_, other_key) = managed_token(&f.engine, 3).await;
+    f.upstream
+        .replies
+        .lock()
+        .await
+        .push_back(Reply::Raw(native_file_events()));
+    let mut request = base();
+    request["claud2api_tools"] = json!(["repl"]);
+    let (status, _, output) = call_key(&f.engine, "/v1/messages", request, None, &owner_key).await;
+    assert_eq!(status, 200, "{output}");
+    let file_result = output["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|block| {
+            block["type"] == "claud2api_native" && block["block"]["type"] == "tool_result"
+        })
+        .unwrap();
+    let file = &file_result["block"]["content"][0];
+    let download_url = file["claud2api_download_url"].as_str().unwrap();
+    assert!(download_url.starts_with("/v1/native-files/v1."));
+    let download_path = download_url.split('?').next().unwrap();
+
+    reset_pacing(&f.engine).await;
+    let downloaded = public_raw(&f.engine, "GET", download_path, &owner_key, Value::Null).await;
+    assert_eq!(downloaded.status(), 200);
+    assert_eq!(
+        downloaded.headers()["content-type"],
+        "application/octet-stream"
+    );
+    assert_eq!(
+        downloaded.headers()["content-security-policy"],
+        "sandbox; default-src 'none'"
+    );
+    assert_eq!(downloaded.headers()["x-content-type-options"], "nosniff");
+    assert!(
+        downloaded.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .contains("attachment;")
+    );
+    assert_eq!(
+        downloaded.into_body().collect().await.unwrap().to_bytes(),
+        Bytes::from_static(b"name,value\nexample,42\n")
+    );
+
+    let requests_before_rejection = f.upstream.traces.lock().await.len();
+    let rejected = public_raw(&f.engine, "GET", download_path, &other_key, Value::Null).await;
+    assert_eq!(rejected.status(), 403);
+    assert_eq!(
+        f.upstream.traces.lock().await.len(),
+        requests_before_rejection
+    );
+
+    let anonymous = web::public(f.engine.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri(download_path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), 401);
+    assert_eq!(
+        f.upstream.traces.lock().await.len(),
+        requests_before_rejection
+    );
+
+    let mut tampered_path = download_path.to_owned();
+    let last = tampered_path.pop().unwrap();
+    tampered_path.push(if last == '0' { '1' } else { '0' });
+    let tampered = public_raw(&f.engine, "GET", &tampered_path, &owner_key, Value::Null).await;
+    assert_eq!(tampered.status(), 404);
+    assert_eq!(
+        f.upstream.traces.lock().await.len(),
+        requests_before_rejection
+    );
+}
+
+#[tokio::test]
+async fn transient_compat_file_output_defers_cleanup_until_its_link_expires() {
+    let f = fixture(1).await;
+    f.upstream
+        .replies
+        .lock()
+        .await
+        .push_back(Reply::Raw(native_file_events()));
+    let request = json!({
+        "model":"test",
+        "claud2api_tools":["repl"],
+        "messages":[{"role":"user","content":"prepare a CSV file"}]
+    });
+    let (status, _, output) = call(&f.engine, "/v1/chat/completions", request, None).await;
+    assert_eq!(status, 200, "{output}");
+    assert_eq!(output["choices"][0]["message"]["content"], "");
+    let file = output["claud2api_native"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|block| block["type"] == "tool_result")
+        .unwrap()["content"][0]
+        .clone();
+    assert!(file["claud2api_download_url"].as_str().is_some());
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 1);
+    assert_eq!(f.upstream.deleted.load(Ordering::SeqCst), 0);
+
+    let state = f.engine.store.read().await;
+    assert_eq!(state.pending.len(), 1);
+    let pending = state.pending[0].clone();
+    assert!(pending.next_attempt >= store::now() + 3500);
+    drop(state);
+
+    f.engine.sweep().await.unwrap();
+    assert_eq!(f.upstream.deleted.load(Ordering::SeqCst), 0);
+    assert!(f.engine.store.read().await.pending.contains(&pending));
+}
+
+#[tokio::test]
+async fn messages_file_cleanup_waits_after_a_context_rebuild() {
+    let f = fixture(1).await;
+    f.upstream.replies.lock().await.extend([
+        Reply::Raw(native_file_events()),
+        Reply::Text("new context response".to_owned()),
+    ]);
+    let mut first_request = base();
+    first_request["claud2api_tools"] = json!(["repl"]);
+    let (status, headers, first) = call(
+        &f.engine,
+        "/v1/messages",
+        first_request,
+        Some("messages-file-context"),
+    )
+    .await;
+    assert_eq!(status, 200, "{first}");
+    assert!(first["content"].as_array().unwrap().iter().any(|block| {
+        block["type"] == "claud2api_native"
+            && block["block"]["type"] == "tool_result"
+            && block["block"]["content"][0]["claud2api_download_url"]
+                .as_str()
+                .is_some()
+    }));
+    let handle = headers["x-c2a-session-id"].to_str().unwrap().to_owned();
+    let old_conversation = f.engine.store.read().await.sessions[&handle]
+        .conversation_id
+        .clone();
+    let old_pending = f
+        .engine
+        .store
+        .read()
+        .await
+        .pending
+        .iter()
+        .find(|item| item.conversation_id == old_conversation)
+        .cloned()
+        .expect("file conversation cleanup job");
+    assert!(old_pending.next_attempt >= store::now() + 3500);
+
+    reset_pacing(&f.engine).await;
+    let mut rebuilt = base();
+    rebuilt["system"] = json!("A changed system context.");
+    rebuilt["claud2api_tools"] = json!(["repl"]);
+    rebuilt["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":first["content"]}),
+        json!({"role":"user","content":"continue in the updated context"}),
+    ]);
+    let (status, _, second) = call(&f.engine, "/v1/messages", rebuilt, Some(&handle)).await;
+    assert_eq!(status, 200, "{second}");
+    let state = f.engine.store.read().await;
+    assert_ne!(state.sessions[&handle].conversation_id, old_conversation);
+    assert!(state.pending.contains(&old_pending));
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 2);
+    drop(state);
+
+    f.engine.sweep().await.unwrap();
+    assert_eq!(f.upstream.deleted.load(Ordering::SeqCst), 0);
+    assert!(f.engine.store.read().await.pending.contains(&old_pending));
+}
+
+#[tokio::test]
+async fn live_legacy_file_cleanup_does_not_starve_later_due_cleanup_jobs() {
+    let f = fixture(1).await;
+    f.upstream
+        .replies
+        .lock()
+        .await
+        .push_back(Reply::Raw(native_file_events()));
+    let request = json!({
+        "model":"test",
+        "conversation_id":"legacy-file-with-download",
+        "claud2api_tools":["repl"],
+        "messages":[{"role":"user","content":"create a linked file"}]
+    });
+    let (status, _, output) = call(&f.engine, "/v1/chat/completions", request, None).await;
+    assert_eq!(status, 200, "{output}");
+    let live_target = f
+        .engine
+        .legacy
+        .lock()
+        .await
+        .values()
+        .next()
+        .unwrap()
+        .1
+        .clone();
+    let account = f.engine.config.accounts[0].id();
+    let other_target = "33333333-3333-4333-8333-333333333333";
+    f.engine
+        .store
+        .mutate("", json!({}), |state| {
+            let live = state
+                .pending
+                .iter_mut()
+                .find(|job| job.conversation_id == live_target)
+                .unwrap();
+            live.next_attempt = 0;
+            state.queue(&account, other_target);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    reset_pacing(&f.engine).await;
+    f.engine.sweep().await.unwrap();
+    assert_eq!(f.upstream.deleted.load(Ordering::SeqCst), 1);
+    let pending = f.engine.store.read().await.pending.clone();
+    assert!(pending.iter().any(|job| job.conversation_id == live_target));
+    assert!(
+        !pending
+            .iter()
+            .any(|job| job.conversation_id == other_target)
+    );
+    let deletes: Vec<_> = f
+        .upstream
+        .traces
+        .lock()
+        .await
+        .iter()
+        .filter(|trace| trace["method"] == "DELETE")
+        .map(|trace| trace["uri"].clone())
+        .collect();
+    assert_eq!(deletes.len(), 1);
+    assert!(deletes[0].as_str().unwrap().contains(other_target));
+    assert!(!deletes[0].as_str().unwrap().contains(&live_target));
+}
+
+#[tokio::test]
+async fn legacy_conversation_id_rejects_a_native_profile_change_before_upstream() {
+    let f = fixture(1).await;
+    f.upstream.replies.lock().await.extend([
+        Reply::Text("first profile".to_owned()),
+        Reply::Text("continued".to_owned()),
+    ]);
+    let mut first = json!({"model":"test","conversation_id":"native-profile","messages":[{"role":"user","content":"first"}]});
+    assert_eq!(
+        call(&f.engine, "/v1/chat/completions", first.clone(), None)
+            .await
+            .0,
+        200
+    );
+    reset_pacing(&f.engine).await;
+    first["claud2api_tools"] = json!(["web_search"]);
+    let before = f.upstream.created.load(Ordering::SeqCst);
+    let (status, _, error) = call(&f.engine, "/v1/chat/completions", first.clone(), None).await;
+    assert_eq!(status, 409, "{error}");
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), before);
+    assert_eq!(
+        completion_requests(&f.upstream.traces.lock().await).len(),
+        1
+    );
+    reset_pacing(&f.engine).await;
+    first.as_object_mut().unwrap().remove("claud2api_tools");
+    first["messages"] = json!([{"role":"user","content":"continue original profile"}]);
+    let (status, _, output) = call(&f.engine, "/v1/chat/completions", first, None).await;
+    assert_eq!(status, 200, "{output}");
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), before);
+    let calls = completion_requests(&f.upstream.traces.lock().await);
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["uri"], calls[1]["uri"]);
+}
+
+#[tokio::test]
+async fn compat_project_profile_is_sticky_and_rejects_project_switches() {
+    let project_a = "11111111-1111-4111-8111-111111111111";
+    let project_b = "22222222-2222-4222-8222-222222222222";
+    for responses in [false, true] {
+        let f = fixture(1).await;
+        f.upstream.replies.lock().await.extend([
+            Reply::Text("first project response".to_owned()),
+            Reply::Text("continued project response".to_owned()),
+        ]);
+        let path = if responses {
+            "/v1/responses"
+        } else {
+            "/v1/chat/completions"
+        };
+        let mut request = json!({"model":"test","conversation_id":"compat-project"});
+        request["claud2api_project_uuid"] = json!(project_a);
+        if responses {
+            request["input"] = json!("first project prompt");
+        } else {
+            request["messages"] = json!([{"role":"user","content":"first project prompt"}]);
+        }
+        let (status, _, first) = call(&f.engine, path, request.clone(), None).await;
+        assert_eq!(status, 200, "{path}: {first}");
+
+        reset_pacing(&f.engine).await;
+        if responses {
+            request["input"] = json!("same project continuation");
+        } else {
+            request["messages"] = json!([{"role":"user","content":"same project continuation"}]);
+        }
+        let (status, _, second) = call(&f.engine, path, request.clone(), None).await;
+        assert_eq!(status, 200, "{path}: {second}");
+
+        reset_pacing(&f.engine).await;
+        request["claud2api_project_uuid"] = json!(project_b);
+        if responses {
+            request["input"] = json!("attempt project switch");
+        } else {
+            request["messages"] = json!([{"role":"user","content":"attempt project switch"}]);
+        }
+        let (status, _, rejected) = call(&f.engine, path, request, None).await;
+        assert_eq!(status, 409, "{path}: {rejected}");
+
+        let traces = f.upstream.traces.lock().await;
+        let calls = completion_requests(&traces);
+        assert_eq!(calls.len(), 2, "{path}");
+        assert_eq!(calls[0]["uri"], calls[1]["uri"]);
+        assert_eq!(
+            calls[1]["body"]["parent_message_uuid"],
+            calls[0]["body"]["turn_message_uuids"]["assistant_message_uuid"]
+        );
+        assert_eq!(calls[0]["body"]["tools"], project_native_descriptors());
+        assert_eq!(calls[1]["body"]["tools"], project_native_descriptors());
+        assert_eq!(f.upstream.created.load(Ordering::SeqCst), 1, "{path}");
+        let bindings: Vec<_> = traces
+            .iter()
+            .filter(|trace| trace["method"] == "PUT")
+            .collect();
+        assert_eq!(bindings.len(), 1, "{path}");
+        assert_eq!(bindings[0]["body"]["project_uuid"], project_a);
+    }
+}
+
 #[tokio::test]
 async fn text_adapters_validate_success_failure_usage_and_upstream_tool_isolation() {
     for responses in [false, true] {
@@ -336,7 +1384,7 @@ async fn text_adapters_validate_success_failure_usage_and_upstream_tool_isolatio
                     .iter()
                     .find(|v| v["uri"].as_str().unwrap().ends_with("/completion"))
                     .unwrap();
-                assert_eq!(request["body"]["tools"], json!([]));
+                assert_eq!(request["body"]["tools"], default_native_descriptors());
                 assert!(request["body"].get("create_conversation_params").is_none());
                 let prompt = request["body"]["prompt"].as_str().unwrap();
                 let transcript: Value =
@@ -589,11 +1637,12 @@ async fn version_one_state_import_preserves_binding_parent_and_cooldown() {
     let f = fixture(1).await;
     let secret = f.engine.config.gateway_key.clone();
     let nonce = "1234567890abcdef1234567890abcdef";
-    let payload = json!({"model":"test","max_tokens":128,"messages":[
+    let mut payload = json!({"model":"test","max_tokens":128,"messages":[
         {"role":"user","content":"Record one."},
         {"role":"assistant","content":"Stored."},
         {"role":"user","content":"Resume the record."}
     ]});
+    payload["claud2api_tools"] = json!([]);
     let projected = protocol::parse(&payload).unwrap();
     let context_hash = projected.context(&secret);
     let history = projected.hashes(&secret);
@@ -1300,10 +2349,34 @@ async fn log_tokens_count_unicode_once_and_preserve_unknown_partial_and_empty_ou
     let f = fixture(1).await;
     let mut events = event(json!({"type":"message_start"}));
     for text in ["你", "好", "a", "b"] {
-        events += &event(json!({"type":"content_block_delta","delta":{"text":text}}));
+        if text == "你" {
+            events += &event(
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            );
+        }
+        events += &event(
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}),
+        );
     }
-    events += &event(json!({"type":"content_block_delta","delta":{"thinking":"思"}}));
-    events += &event(json!({"type":"content_block_delta","delta":{"partial_json":"{}"}}));
+    events += &event(json!({"type":"content_block_stop","index":0}));
+    events += &event(
+        json!({"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}),
+    );
+    events += &event(
+        json!({"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"思"}}),
+    );
+    events += &event(json!({"type":"content_block_stop","index":1}));
+    events += &event(
+        json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu-token-count","name":"web_search","input":{}}}),
+    );
+    events += &event(
+        json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+    );
+    events += &event(json!({"type":"content_block_stop","index":2}));
+    events += &event(
+        json!({"type":"content_block_start","index":3,"content_block":{"type":"tool_result","tool_use_id":"toolu-token-count","content":[],"is_error":false}}),
+    );
+    events += &event(json!({"type":"content_block_stop","index":3}));
     events += &event(json!({"type":"message_stop"}));
     f.upstream
         .replies
@@ -1613,7 +2686,7 @@ async fn messages_json_stream_and_exact_browser_headers() {
         .iter()
         .find(|v| v["uri"].as_str().unwrap().ends_with("/completion"))
         .unwrap();
-    assert_eq!(request["body"]["tools"], json!([]));
+    assert_eq!(request["body"]["tools"], default_native_descriptors());
     assert_eq!(request["body"]["thinking_mode"], "off");
     for (name, value) in [
         ("sec-ch-ua-platform", "\"Windows\""),
@@ -1924,11 +2997,12 @@ async fn appended_instructions_do_not_rebase_a_checkpoint_from_the_old_context()
     assert_eq!(f.upstream.created.load(Ordering::SeqCst), created);
     assert!(current.checkpoint.is_none());
     assert_ne!(current.context_hash, before.context_hash);
+    let mut parsed = protocol::parse(&payload).unwrap();
+    parsed.native_tools =
+        claud2api::native_tools::resolve(&payload, &f.engine.store.read().await.settings).unwrap();
     assert_eq!(
         current.context_hash,
-        protocol::parse(&payload)
-            .unwrap()
-            .context(&f.engine.config.gateway_key)
+        parsed.context(&f.engine.config.gateway_key)
     );
     let traces = f.upstream.traces.lock().await;
     let last = traces
@@ -2811,7 +3885,9 @@ async fn compaction_input(f: &Fixture) -> (String, Value) {
         messages.push(json!({"role":"assistant","content":"y".repeat(600)}));
     }
     messages.push(json!({"role":"user","content":"continue"}));
-    let input = protocol::parse(&v).unwrap();
+    let mut input = protocol::parse(&v).unwrap();
+    input.native_tools =
+        claud2api::native_tools::resolve(&v, &f.engine.store.read().await.settings).unwrap();
     let hashes = input.hashes(&f.engine.config.gateway_key);
     f.engine
         .store
@@ -2846,6 +3922,21 @@ async fn compaction_creates_checkpoint_and_rotates_after_success() {
     assert!(current.checkpoint.is_some());
     assert_eq!(out["usage"]["cache_read_input_tokens"], 0);
     assert!(state.pending.iter().any(|j| j.conversation_id == old));
+    let traces = f.upstream.traces.lock().await;
+    let upstream_calls = completion_requests(&traces);
+    assert_eq!(upstream_calls.len(), 3);
+    assert_eq!(upstream_calls[1]["body"]["tools"], json!([]));
+    assert_eq!(
+        upstream_calls[2]["body"]["tools"],
+        default_native_descriptors()
+    );
+    assert!(
+        upstream_calls[1]["body"]["prompt"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Claud2Api internal compaction]")
+    );
+    drop(traces);
     let usage = f.engine.store.usage(store::now() - 18000).await.unwrap();
     assert_eq!(usage["requests"], 3);
     let logs = logs_for_request(&f.engine, headers["x-request-id"].to_str().unwrap()).await;
@@ -3057,7 +4148,7 @@ async fn durable_failure_latches_health_and_prevents_upstream_work() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 #[tokio::test]
-async fn unknown_event_before_quota_is_uncertain_and_never_replayed() {
+async fn unknown_event_before_quota_fails_after_generation_and_is_never_replayed() {
     let f = fixture(2).await;
     f.upstream.replies.lock().await.extend([
         Reply::Raw(
@@ -3067,7 +4158,7 @@ async fn unknown_event_before_quota_is_uncertain_and_never_replayed() {
         Reply::Text("must not run".to_owned()),
     ]);
     let (status, _, _) = call(&f.engine, "/v1/messages", base(), Some("unknown-event")).await;
-    assert_eq!(status, 429);
+    assert_eq!(status, 502);
     assert_eq!(f.upstream.created.load(Ordering::SeqCst), 1);
     assert_eq!(f.upstream.replies.lock().await.len(), 1);
 }
@@ -3131,6 +4222,26 @@ async fn disabling_an_account_drains_active_work_without_releasing_its_slot() {
 async fn runtime_settings_revision_range_and_events_are_consistent() {
     let f = fixture(1).await;
     let (_, settings) = admin(&f.engine, "GET", "/settings", Value::Null, None).await;
+    let original_revision = settings["revision"].as_u64().unwrap();
+    let original_settings = settings["settings"].clone();
+    let mut incomplete = original_settings.clone();
+    incomplete
+        .as_object_mut()
+        .unwrap()
+        .remove("native_web_search");
+    let (status, _) = admin(
+        &f.engine,
+        "PUT",
+        "/settings",
+        json!({"expected_revision":original_revision,"settings":incomplete}),
+        None,
+    )
+    .await;
+    assert_eq!(status, 400);
+    let (_, after_incomplete) = admin(&f.engine, "GET", "/settings", Value::Null, None).await;
+    assert_eq!(after_incomplete["revision"], original_revision);
+    assert_eq!(after_incomplete["settings"], original_settings);
+
     let mut invalid = settings["settings"].clone();
     invalid["account_min_interval_seconds"] = json!(0);
     let (status, _) = admin(

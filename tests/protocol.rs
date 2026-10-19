@@ -1,5 +1,7 @@
 use claud2api::{
+    config::Settings,
     engine::{compaction_cut, normalize_summary},
+    native_tools,
     protocol::{self, Block, ToolDecoder},
     transport::SseDecoder,
 };
@@ -33,6 +35,9 @@ fn message_envelope_preserves_roles_tool_contract_and_historical_summary() {
 }
 fn request() -> Value {
     json!({"model":"claude-haiku-5-5","max_tokens":100,"messages":[{"role":"user","content":"hello"}]})
+}
+fn native(block: Value) -> Value {
+    json!({"type":"claud2api_native","block":block})
 }
 #[test]
 fn optional_controls_are_projected_without_touching_data() {
@@ -283,6 +288,375 @@ fn hmac_html_and_struct_order_are_stable() {
         protocol::go_json("<>&\u{2028}\u{2029}"),
         r#""\u003c\u003e\u0026\u2028\u2029""#
     );
+}
+#[test]
+fn native_web_blocks_and_citations_roundtrip_in_assistant_history() {
+    let tool_use = json!({
+        "type":"tool_use","id":"native-1","name":"web_search","input":{"query":"official docs"},
+        "tool_origin":"first_party","message":"Searching the web"
+    });
+    let tool_result = json!({
+        "type":"tool_result","tool_use_id":"native-1","is_error":false,
+        "content":[{"type":"knowledge","title":"Official guide","url":"https://example.test/guide","metadata":{"site_name":"Example"}}],
+        "structured_content":{"sources":1}
+    });
+    let citation = json!({
+        "type":"citation",
+        "citation":{"text_block_index":0,"start_index":2,"end_index":7,"cited_text":"世界","url":"https://example.test/guide"}
+    });
+    let mut raw = request();
+    raw["messages"] = json!([
+        {"role":"user","content":"查资料"},
+        {"role":"assistant","content":[native(tool_use.clone()),native(tool_result.clone()),native(citation.clone())]},
+        {"role":"user","content":"继续"}
+    ]);
+
+    let parsed = protocol::parse(&raw).unwrap();
+    let serialized = serde_json::to_value(&parsed.turns).unwrap();
+    assert_eq!(serialized[1]["content"][0]["block"], tool_use);
+    assert_eq!(serialized[1]["content"][1]["block"], tool_result);
+    assert_eq!(serialized[1]["content"][2]["block"], citation);
+    assert_eq!(parsed.hashes("key")[1].len(), 64);
+}
+#[test]
+fn native_blocks_are_assistant_only_bounded_and_paired_within_one_turn() {
+    let call = native(json!({"type":"tool_use","id":"n1","name":"web_search","input":{}}));
+    let result = native(json!({"type":"tool_result","tool_use_id":"n1","content":[]}));
+
+    let mut valid = request();
+    valid["messages"] = json!([
+        {"role":"user","content":"one"},
+        {"role":"assistant","content":[call.clone(),result.clone()]},
+        {"role":"user","content":"two"}
+    ]);
+    assert!(protocol::parse(&valid).is_ok());
+
+    for messages in [
+        json!([
+            {"role":"user","content":"one"},
+            {"role":"assistant","content":[call.clone()]},
+            {"role":"user","content":"two"}
+        ]),
+        json!([
+            {"role":"user","content":"one"},
+            {"role":"assistant","content":[result.clone()]},
+            {"role":"user","content":"two"}
+        ]),
+        json!([
+            {"role":"user","content":[call.clone()]}
+        ]),
+        json!([
+            {"role":"user","content":"one"},
+            {"role":"assistant","content":[call.clone()]},
+            {"role":"assistant","content":[result.clone()]},
+            {"role":"user","content":"two"}
+        ]),
+    ] {
+        let mut raw = request();
+        raw["messages"] = messages;
+        assert!(protocol::parse(&raw).is_err());
+    }
+
+    let mut system_extension = request();
+    system_extension["system"] = json!([native(json!({
+        "type":"citation","citation":{"url":"https://example.test"}
+    }))]);
+    assert!(protocol::parse(&system_extension).is_err());
+
+    let mut client_result_extension = request();
+    client_result_extension["tools"] = tool_request()["tools"].clone();
+    client_result_extension["messages"] = json!([
+        {"role":"user","content":"run"},
+        {"role":"assistant","content":[{"type":"tool_use","id":"client-1","name":"read","input":{}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"client-1","content":[native(json!({
+            "type":"citation","citation":{"url":"https://example.test"}
+        }))]}]}
+    ]);
+    assert!(protocol::parse(&client_result_extension).is_err());
+
+    let mut duplicate = request();
+    duplicate["messages"] = json!([
+        {"role":"user","content":"one"},
+        {"role":"assistant","content":[call.clone(),call,result]},
+        {"role":"user","content":"two"}
+    ]);
+    assert!(protocol::parse(&duplicate).is_err());
+
+    let oversized = native(json!({
+        "type":"citation",
+        "citation":{"data":"x".repeat((8 << 20) + 1)}
+    }));
+    let mut too_large = request();
+    too_large["messages"] = json!([
+        {"role":"user","content":"one"},
+        {"role":"assistant","content":[oversized]},
+        {"role":"user","content":"two"}
+    ]);
+    assert!(protocol::parse(&too_large).is_err());
+
+    let mut nested = json!(null);
+    for _ in 0..66 {
+        nested = json!({"next":nested});
+    }
+    let too_deep = native(json!({"type":"citation","citation":{"nested":nested}}));
+    let mut deep = request();
+    deep["messages"] = json!([
+        {"role":"user","content":"one"},
+        {"role":"assistant","content":[too_deep]},
+        {"role":"user","content":"two"}
+    ]);
+    assert!(protocol::parse(&deep).is_err());
+}
+#[test]
+fn official_api_server_tool_result_requires_gateway_extension() {
+    let mut raw = request();
+    raw["messages"][0]["content"] = json!([{"type":"web_search_tool_result","content":[]}]);
+    let err = protocol::parse(&raw).unwrap_err();
+    assert!(err.message.contains("use a claud2api_native extension"));
+}
+#[test]
+fn native_tool_settings_migrate_and_resolve_canonical_groups() {
+    let settings = Settings::default();
+    assert!(settings.native_web_search && settings.native_artifacts);
+    assert!(settings.native_repl && settings.native_widgets);
+    assert!(settings.native_project_knowledge);
+
+    let mut old_snapshot = serde_json::to_value(&settings).unwrap();
+    for key in [
+        "native_web_search",
+        "native_artifacts",
+        "native_repl",
+        "native_widgets",
+        "native_project_knowledge",
+    ] {
+        old_snapshot.as_object_mut().unwrap().remove(key);
+    }
+    let migrated: Settings = serde_json::from_value(old_snapshot).unwrap();
+    assert!(migrated.native_web_search && migrated.native_artifacts);
+    assert!(migrated.native_repl && migrated.native_widgets);
+    assert!(migrated.native_project_knowledge);
+
+    assert_eq!(
+        native_tools::resolve(&json!({}), &settings).unwrap(),
+        vec![
+            "web_search".to_owned(),
+            "artifacts".to_owned(),
+            "repl".to_owned(),
+            "widgets".to_owned()
+        ]
+    );
+    assert_eq!(
+        native_tools::resolve(
+            &json!({"claud2api_tools":["widgets","web_search"]}),
+            &settings
+        )
+        .unwrap(),
+        vec!["web_search".to_owned(), "widgets".to_owned()]
+    );
+    assert!(
+        native_tools::resolve(
+            &json!({"claud2api_tools":["web_search","web_search"]}),
+            &settings
+        )
+        .is_err()
+    );
+    assert!(native_tools::resolve(&json!({"claud2api_tools":["connectors"]}), &settings).is_err());
+    assert!(
+        native_tools::resolve(&json!({"claud2api_tools":["project_knowledge"]}), &settings)
+            .is_err()
+    );
+    assert!(native_tools::resolve(&json!({"claud2api_tools":null}), &settings).is_err());
+    assert!(
+        native_tools::resolve(&json!({"claud2api_tools":[]}), &settings)
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut restricted = settings.clone();
+    restricted.native_repl = false;
+    assert_eq!(
+        native_tools::resolve(&json!({}), &restricted).unwrap(),
+        vec![
+            "web_search".to_owned(),
+            "artifacts".to_owned(),
+            "widgets".to_owned()
+        ]
+    );
+    assert!(native_tools::resolve(&json!({"claud2api_tools":["repl"]}), &restricted).is_err());
+}
+
+#[test]
+fn project_binding_requires_canonical_uuid_and_gates_project_knowledge() {
+    const PROJECT: &str = "123e4567-e89b-12d3-a456-426614174000";
+    let settings = Settings::default();
+    let mut raw = request();
+    raw["claud2api_project_uuid"] = json!(PROJECT);
+    let input = protocol::parse(&raw).unwrap();
+    assert_eq!(input.project_uuid.as_deref(), Some(PROJECT));
+    assert_ne!(
+        input.context("key"),
+        protocol::parse(&request()).unwrap().context("key")
+    );
+    assert!(
+        input
+            .prompt("n")
+            .contains(&format!("\"project_uuid\":\"{PROJECT}\""))
+    );
+    assert_eq!(
+        native_tools::resolve(&raw, &settings).unwrap(),
+        vec![
+            "web_search".to_owned(),
+            "artifacts".to_owned(),
+            "repl".to_owned(),
+            "widgets".to_owned(),
+            "project_knowledge".to_owned(),
+        ]
+    );
+    assert_eq!(
+        native_tools::resolve(
+            &json!({"claud2api_project_uuid":PROJECT,"claud2api_tools":[]}),
+            &settings
+        )
+        .unwrap(),
+        Vec::<String>::new()
+    );
+    assert!(
+        native_tools::resolve(
+            &json!({"claud2api_project_uuid":PROJECT,"claud2api_tools":["project_knowledge"]}),
+            &Settings {
+                native_project_knowledge: false,
+                ..settings.clone()
+            }
+        )
+        .is_err()
+    );
+
+    for invalid in [
+        json!(null),
+        json!(123),
+        json!("123E4567-E89B-12D3-A456-426614174000"),
+        json!("123e4567-e89b-12d3-a456-426614174000/extra"),
+    ] {
+        let mut invalid_request = request();
+        invalid_request["claud2api_project_uuid"] = invalid;
+        assert!(protocol::parse(&invalid_request).is_err());
+        assert!(native_tools::resolve(&invalid_request, &settings).is_err());
+    }
+}
+#[test]
+fn native_registry_descriptors_and_subtool_allowlist_are_bounded() {
+    let groups = vec![
+        "web_search".to_owned(),
+        "artifacts".to_owned(),
+        "repl".to_owned(),
+        "widgets".to_owned(),
+    ];
+    let descriptors = native_tools::descriptors(&groups);
+    assert_eq!(
+        descriptors[0],
+        json!({"type":"web_search_v0","name":"web_search"})
+    );
+    assert_eq!(
+        descriptors[1],
+        json!({"type":"artifacts_v0","name":"artifacts"})
+    );
+    assert_eq!(descriptors[2], json!({"type":"repl_v0","name":"repl"}));
+    assert_eq!(
+        descriptors[3],
+        json!({"type":"send_to_user_v0","name":"send_to_user"})
+    );
+    assert_eq!(descriptors.as_array().unwrap().len(), 41);
+
+    let names = native_tools::allowed_names(&groups);
+    for name in [
+        "web_fetch",
+        "web_search_fast",
+        "bash_tool",
+        "create_file",
+        "str_replace_editor",
+        "file_search",
+        "kill_bash",
+        "Artifact",
+        "weather_fetch",
+        "chart_display_v0",
+    ] {
+        assert!(names.iter().any(|candidate| candidate == name), "{name}");
+    }
+    for name in [
+        "send_to_user",
+        "ask_user_input_v0",
+        "message_compose_v1",
+        "offer_schedule_v0",
+        "approved_connectors_display_v0",
+    ] {
+        assert!(names.iter().any(|candidate| candidate == name), "{name}");
+    }
+    assert!(!names.iter().any(|name| name == "arbitrary_connector"));
+
+    let project_groups = vec!["project_knowledge".to_owned()];
+    assert_eq!(
+        native_tools::descriptors(&project_groups),
+        json!([{"type":"project_knowledge_search","name":"project_knowledge_search"}])
+    );
+    assert_eq!(
+        native_tools::allowed_names(&project_groups),
+        vec!["project_knowledge_search"]
+    );
+}
+#[test]
+fn native_sanitizer_removes_control_metadata_but_preserves_user_data() {
+    let clean = native_tools::sanitize(json!({
+        "type":"tool_use",
+        "approval_key":"credential",
+        "mcp_server_url":"private endpoint",
+        "meta":{"approval_options":"control","label":"safe"},
+        "input":{"approval_key":"user supplied","mcp_server_url":"user data"},
+        "content":{"approval_options":"user content"}
+    }));
+    assert!(clean.get("approval_key").is_none());
+    assert!(clean.get("mcp_server_url").is_none());
+    assert!(clean["meta"].get("approval_options").is_none());
+    assert_eq!(clean["meta"]["label"], "safe");
+    assert_eq!(clean["input"]["approval_key"], "user supplied");
+    assert_eq!(clean["input"]["mcp_server_url"], "user data");
+    assert_eq!(clean["content"]["approval_options"], "user content");
+}
+#[test]
+fn native_context_is_omitted_when_disabled_and_changes_when_enabled() {
+    let mut input = protocol::parse(&request()).unwrap();
+    let disabled = input.context("key");
+    input.native_tools.clear();
+    assert_eq!(input.context("key"), disabled);
+    input.native_tools.push("web_search".to_owned());
+    assert_ne!(input.context("key"), disabled);
+    assert!(
+        input
+            .prompt("n")
+            .contains("\"native_tools\":[\"web_search\"]")
+    );
+    assert!(
+        input
+            .prompt("n")
+            .contains("tool_policy applies only to client_tools")
+    );
+    assert!(input.prompt("n").contains("<tool_call_n>"));
+}
+#[test]
+fn tool_decoder_native_boundary_flushes_text_and_rejects_partial_frames() {
+    let mut required = tool_request();
+    required["tool_choice"] = json!({"type":"any"});
+    let input = protocol::parse(&required).unwrap();
+    let mut decoder = ToolDecoder::new(&input, "edge");
+    assert_eq!(
+        decoder.feed("before <tool_call").unwrap(),
+        vec![Block::text("before ")]
+    );
+    assert_eq!(decoder.boundary().unwrap(), vec![Block::text("<tool_call")]);
+    assert!(decoder.finish().is_err());
+
+    let mut decoder = ToolDecoder::new(&input, "edge");
+    decoder.feed("<tool_call_edge>{").unwrap();
+    assert!(decoder.boundary().is_err());
 }
 #[test]
 fn sse_parser_handles_fragmented_utf8_crlf_and_multiline_data() {

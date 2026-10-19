@@ -126,6 +126,7 @@ async fn observe(State(e): State<Arc<Engine>>, mut req: Request, next: Next) -> 
         "/v1/responses" => "responses",
         "/v1/models" => "models",
         "/health" => "health",
+        p if p.starts_with("/v1/native-files/") => "native_file",
         p if p.starts_with("/v1/conversations/") => "conversation_delete",
         _ => "unknown",
     };
@@ -169,6 +170,7 @@ pub fn public(e: Arc<Engine>) -> Router {
         .route("/models", get(models))
         .route("/chat/completions", post(crate::compat::chat))
         .route("/responses", post(crate::compat::responses))
+        .route("/native-files/{handle}", get(crate::native_files::download))
         .route("/conversations/{id}", delete(crate::compat::remove))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(e.clone(), auth));
@@ -203,12 +205,13 @@ async fn messages(
     let raw = parse_json(&bytes)?;
     trace.requested_model(raw["model"].as_str().unwrap_or(""));
     let mut input = protocol::parse(&raw)?;
-    let selected = e
-        .store
-        .read()
-        .await
-        .models
-        .resolve(raw["model"].as_str().unwrap_or(""), "")?;
+    let selected = {
+        let state = e.store.read().await;
+        input.native_tools = crate::native_tools::resolve(&raw, &state.settings)?;
+        state
+            .models
+            .resolve(raw["model"].as_str().unwrap_or(""), "")?
+    };
     input.model = selected.upstream;
     let stream = input.stream;
     let model = selected.public;
@@ -306,9 +309,9 @@ async fn messages(
         (
             "x-claud2api-limitations",
             if settings.simulated_cache {
-                "usage-estimated,max-tokens-advisory,text-tool-bridge,controls-not-forwarded,cache-simulated"
+                "usage-estimated,max-tokens-advisory,text-tool-bridge,native-web-extensions,controls-not-forwarded,cache-simulated"
             } else {
-                "usage-estimated,max-tokens-advisory,text-tool-bridge,controls-not-forwarded"
+                "usage-estimated,max-tokens-advisory,text-tool-bridge,native-web-extensions,controls-not-forwarded"
             },
         ),
         ("x-accel-buffering", "no"),
@@ -401,8 +404,33 @@ impl MessageView {
                     out.push(json!({"type":"content_block_stop","index":index}));
                     self.blocks.push(b);
                 }
+                Block::Native { .. } => {
+                    self.close(&mut out);
+                    let index = self.blocks.len();
+                    out.push(json!({"type":"content_block_start","index":index,"content_block":b}));
+                    out.push(json!({"type":"content_block_stop","index":index}));
+                    self.blocks.push(b);
+                }
                 _ => {}
             },
+            Output::NativeStart(block) => {
+                self.close(&mut out);
+                let index = self.blocks.len();
+                let block = Block::Native { block };
+                out.push(json!({"type":"content_block_start","index":index,"content_block":block}));
+                self.blocks.push(block);
+            }
+            Output::NativeDelta(delta) => {
+                out.push(json!({"type":"content_block_delta","index":self.blocks.len()-1,"delta":{"type":"claud2api_native_delta","delta":delta}}));
+            }
+            Output::NativeStop(block) => {
+                let index = self.blocks.len() - 1;
+                let block = Block::Native { block };
+                out.push(
+                    json!({"type":"content_block_stop","index":index,"claud2api_block":block}),
+                );
+                self.blocks[index] = block;
+            }
             Output::Done {
                 reason,
                 sequence,

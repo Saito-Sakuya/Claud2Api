@@ -79,7 +79,12 @@ limit 默认 100，限制在 1–200；没有内置主动推送。
     "account_requests_per_minute": 6,
     "rate_limit_min_seconds": 60,
     "rate_limit_fallback_seconds": 18000,
-    "overload_seconds": 15
+    "overload_seconds": 15,
+    "native_web_search": true,
+    "native_artifacts": true,
+    "native_repl": true,
+    "native_widgets": true,
+    "native_project_knowledge": true
   }
 }
 ```
@@ -87,6 +92,9 @@ limit 默认 100，限制在 1–200；没有内置主动推送。
 允许范围见[可保存的运行参数](DEPLOY.md#可保存的运行参数)，未知 settings 字段会被拒绝。
 修改用于后续请求，执行中的请求保留已捕获限制；保存后的值跨重启保留。
 示例 revision 只是占位值，应使用 GET 返回的当前值，不能以示例覆盖未经审核的现有设置。
+五个 `native_*` 开关默认开启，可在设置页逐组关闭；旧状态文件缺少这些字段时按开启迁移。
+公开请求可用 `claud2api_tools` 再选择子集，不能覆盖管理员关闭的组。项目知识搜索还要求请求提供
+`claud2api_project_uuid`；未指定项目 UUID 时，它不会加入默认工具组。
 
 
 导入的 `credential` 接受原始 Session Key、完整 Cookie 或 `账号名:Session Key`。

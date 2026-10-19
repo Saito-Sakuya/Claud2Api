@@ -21,6 +21,9 @@ pub enum Output {
         read: usize,
     },
     Block(Block),
+    NativeStart(Value),
+    NativeDelta(Value),
+    NativeStop(Value),
     Done {
         reason: String,
         sequence: Option<String>,
@@ -548,8 +551,22 @@ impl Engine {
             })
             .await?;
         let state = self.store.read().await;
+        let legacy_targets: HashSet<_> = self
+            .legacy
+            .lock()
+            .await
+            .values()
+            .map(|entry| (entry.0.clone(), entry.1.clone()))
+            .collect();
         let mut seen = HashSet::new();
         for job in state.pending.iter().filter(|j| j.next_attempt <= now()) {
+            if state.sessions.values().any(|session| {
+                session.account_id == job.account_id
+                    && session.conversation_id == job.conversation_id
+            }) || legacy_targets.contains(&(job.account_id.clone(), job.conversation_id.clone()))
+            {
+                continue;
+            }
             if !seen.insert(job.account_id.clone()) {
                 continue;
             }
@@ -570,6 +587,12 @@ impl Engine {
                 || latest.sessions.values().any(|s| {
                     s.account_id == job.account_id && s.conversation_id == job.conversation_id
                 })
+                || self
+                    .legacy
+                    .lock()
+                    .await
+                    .values()
+                    .any(|entry| entry.0 == job.account_id && entry.1 == job.conversation_id)
             {
                 continue;
             }
