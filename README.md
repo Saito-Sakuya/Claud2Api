@@ -51,7 +51,8 @@ CLAUDE_LOCALE=zh-CN
 
 ```sh
 sudo chmod 600 /srv/claud2api-private/settings.env
-sudo docker compose --env-file /srv/claud2api-private/settings.env up -d --build
+sudo docker compose --env-file /srv/claud2api-private/settings.env pull
+sudo docker compose --env-file /srv/claud2api-private/settings.env up -d --no-build
 curl http://127.0.0.1:18081/health
 ```
 
@@ -60,7 +61,7 @@ curl http://127.0.0.1:18081/health
 
 原生安装及更多启动参数见 [安装说明](DEPLOY.md)。
 
-在线版本检查、升级与回退见 [版本管理](UPDATES_ZH.md)。
+在线版本检查、升级与回退见 [版本管理](UPDATES_ZH.md)。镜像标签和下载文件用途见[发行文件说明](RELEASES_ZH.md)。
 
 ## 管理控制台
 

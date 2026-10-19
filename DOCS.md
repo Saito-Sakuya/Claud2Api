@@ -17,6 +17,7 @@ use the language links below or at the top of each guide.
 
 | Topic | 中文 | English | Contents |
 |---|---|---|---|
+| Release files | [发行文件说明](RELEASES_ZH.md) | [Release files](RELEASES.md) | alpha4/alpha5, Docker tags and downloadable assets |
 | Managed updates | [版本管理](UPDATES_ZH.md) | [Version manager](UPDATES.md) | Checking for updates, upgrading and rolling back |
 | Overview | [README](README.md) | [README](README_EN.md) | Installation, console usage, API entry and disclaimer |
 | Developer guide | [开发者文档](DEVELOPMENT_ZH.md) | [Developer guide](DEVELOPMENT.md) | Architecture, resource/state ownership, extension, testing and releases |

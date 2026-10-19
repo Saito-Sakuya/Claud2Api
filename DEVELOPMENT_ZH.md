@@ -43,6 +43,11 @@ Messages 文本／客户端工具桥接。上游是网页会话服务，因此�
 | [src/control.rs](src/control.rs) | 管理员及受限 Bot 信息接口 |
 | [src/compat.rs](src/compat.rs) | 独立 Chat／Responses／旧会话删除兼容接口 |
 | [src/error.rs](src/error.rs) | 脱敏的结构化错误 |
+| [Dockerfile](Dockerfile) | 从源码构建镜像 |
+| [Dockerfile.release](Dockerfile.release) | 将已验证的 Release 二进制装入发行镜像 |
+| [.github/workflows/release.yml](.github/workflows/release.yml) | 校验版本、发布 GHCR 镜像及完整 Release 资产 |
+| [scripts/package_release.py](scripts/package_release.py) | 二进制、更新清单、许可归档及校验和 |
+| [scripts/container_acceptance.py](scripts/container_acceptance.py) | 使用合成密钥和临时状态验收最终镜像 |
 | [ui/](ui/) | 嵌入式页面、应用状态、图表、统一下拉框及 Logo |
 | [tests/](tests/) | 协议、配置及模拟上游集成回归 |
 | [scripts/](scripts/) | 密钥生成、许可清单、发行打包与升级验收 |

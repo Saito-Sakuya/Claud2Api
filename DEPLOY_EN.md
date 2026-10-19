@@ -7,7 +7,8 @@
 Prepare the configuration described in [README](README_EN.md), then run:
 
 ```sh
-docker compose --env-file /srv/claud2api-private/settings.env up -d --build
+docker compose --env-file /srv/claud2api-private/settings.env pull
+docker compose --env-file /srv/claud2api-private/settings.env up -d --no-build
 docker compose --env-file /srv/claud2api-private/settings.env logs --tail=100
 ```
 
@@ -20,6 +21,10 @@ limit is 256 MiB; adjust it according to measured account/request load.
 Only reverse-proxy `/health` and `/v1/*` to `127.0.0.1:18081`. Use an SSH tunnel
 for the control port. If the reverse proxy is another container, choose its backend
 address according to the host network topology; its own loopback is not this service.
+
+The default is a published Linux AMD64 image; server-side compilation is unnecessary. Set `CLAUD2API_IMAGE` to pin another release, for example `ghcr.io/saito-sakuya/claud2api:0.1.0-alpha.4`. To build from source, use `docker compose --env-file /srv/claud2api-private/settings.env up -d --build`.
+
+See [release files](RELEASES.md) for downloads and checksum verification.
 
 ## Native build
 

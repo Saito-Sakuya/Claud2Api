@@ -51,6 +51,11 @@ the corresponding native API capability.
 | [src/control.rs](src/control.rs) | Administrator and restricted Bot information endpoints |
 | [src/compat.rs](src/compat.rs) | Separate Chat/Responses/conversation-delete compatibility routes |
 | [src/error.rs](src/error.rs) | Sanitized structured failures |
+| [Dockerfile](Dockerfile) | Build an image from source |
+| [Dockerfile.release](Dockerfile.release) | Package the verified Release binary in the published image |
+| [.github/workflows/release.yml](.github/workflows/release.yml) | Version checks, GHCR publication and complete Release assets |
+| [scripts/package_release.py](scripts/package_release.py) | Binary, update manifest, license archive and checksums |
+| [scripts/container_acceptance.py](scripts/container_acceptance.py) | Verify the final image with synthetic keys and disposable state |
 | [ui/](ui/) | Embedded HTML/CSS, application state, charts, uniform selects and Logo |
 | [tests/](tests/) | Protocol, configuration and mock-upstream integration regressions |
 | [scripts/](scripts/) | Key generation, license inventory, release packaging and update acceptance |

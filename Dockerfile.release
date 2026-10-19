@@ -1,0 +1,13 @@
+FROM gcr.io/distroless/cc-debian13:nonroot
+WORKDIR /app
+COPY --chmod=0755 release/claud2api-linux-amd64 /app/claud2api
+COPY LICENSE THIRD_PARTY.md /app/
+COPY LICENSES/ /app/LICENSES/
+LABEL org.opencontainers.image.source="https://github.com/Saito-Sakuya/Claud2Api" \
+      org.opencontainers.image.description="Claud2Api gateway and private control console" \
+      org.opencontainers.image.licenses="MIT"
+ENV PORT=8080 BIND_HOST=127.0.0.1 CONTROL_BIND=127.0.0.1:18082 CLAUD2API_DATA_DIR=/var/lib/claud2api
+USER 65532:65532
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s CMD ["/app/claud2api", "--healthcheck"]
+ENTRYPOINT ["/app/claud2api"]

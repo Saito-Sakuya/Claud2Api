@@ -15,6 +15,12 @@ jobs:
       CARGO_BUILD_JOBS: 4
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: cargo-downloads-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
       - run: apt-get update && apt-get install -y --no-install-recommends cmake perl pkg-config libclang-dev python3 binutils
       - run: rustup component add rustfmt clippy
       - run: cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked --all-targets
@@ -29,8 +35,53 @@ jobs:
           name: release-assets
           path: release/*
           if-no-files-found: error
-  publish:
+  container:
     needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release
+      - name: Build the image from the verified release binary
+        id: image
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          VERSION="${RELEASE_TAG#v}"
+          (cd release && sha256sum --check SHA256SUMS)
+          docker build --platform linux/amd64 -f Dockerfile.release \
+            --label "org.opencontainers.image.version=$RELEASE_TAG" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            -t "$IMAGE:$VERSION" -t "$IMAGE:$RELEASE_TAG" .
+          echo "name=$IMAGE:$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Verify the final image
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 scripts/container_acceptance.py --image "$IMAGE" --version "$RELEASE_TAG"
+      - name: Publish to GitHub Container Registry
+        id: push
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE"
+          docker push "${IMAGE%:*}:$RELEASE_TAG"
+          DIGEST=$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}')
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+  publish:
+    needs: [package, container]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -40,6 +91,9 @@ jobs:
           name: release-assets
           path: release
       - uses: actions/github-script@v7
+        env:
+          RELEASE_IMAGE: ${{ needs.container.outputs.image }}
+          RELEASE_IMAGE_DIGEST: ${{ needs.container.outputs.digest }}
         with:
           script: |
             const fs = require('node:fs');
@@ -56,10 +110,12 @@ jobs:
               if (error.status !== 404) throw error;
               release = (await github.rest.repos.createRelease({...repo, tag_name: tag,
                 name: tag, draft: true, prerelease: tag.split('+')[0].includes('-'),
-                body: 'Compatible Linux AMD64 release. See UPDATES.md / UPDATES_ZH.md for managed updates and rollback.'})).data;
+                body: fs.readFileSync('release/RELEASE_NOTES.md', 'utf8') +
+                  '\n\nDocker: `' + process.env.RELEASE_IMAGE + '`\n\nDigest: `' + process.env.RELEASE_IMAGE_DIGEST + '`\n\n' +
+                  '[发行文件说明 / Release files](https://github.com/' + context.repo.owner + '/' + context.repo.repo + '/blob/' + tag + '/RELEASES_ZH.md)'})).data;
             }
             // Keep the draft invisible until every asset has its expected digest.
-            for (const name of ['claud2api-linux-amd64', 'claud2api-update.json', 'SHA256SUMS']) {
+            for (const name of ['claud2api-linux-amd64', 'claud2api-update.json', 'claud2api-licenses.tar.gz', 'SHA256SUMS']) {
               const existing = release.assets.find(asset => asset.name === name);
               if (existing) await github.rest.repos.deleteReleaseAsset({...repo, asset_id: existing.id});
               const data = fs.readFileSync('release/' + name);

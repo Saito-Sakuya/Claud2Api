@@ -7,6 +7,7 @@
 - Reimplement Chat/Responses text adapters with role-preserving structured conversations and strict text validation.
 - Remove the bundled web tool catalog and old snapshots; report stream failures separately and calculate consistent character-based usage estimates.
 - Update the Messages prompt envelope while retaining tool-frame and persisted-state compatibility.
+- Fix container packaging and publish verified Linux AMD64 Release assets, licenses and GHCR images.
 
 ## v0.1.0-alpha.3 · 2026-10-18
 

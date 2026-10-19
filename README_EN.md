@@ -53,7 +53,8 @@ Protect the configuration and start:
 
 ```sh
 sudo chmod 600 /srv/claud2api-private/settings.env
-sudo docker compose --env-file /srv/claud2api-private/settings.env up -d --build
+sudo docker compose --env-file /srv/claud2api-private/settings.env pull
+sudo docker compose --env-file /srv/claud2api-private/settings.env up -d --no-build
 curl http://127.0.0.1:18081/health
 ```
 
@@ -63,7 +64,7 @@ Never commit account credentials, proxy passwords or keys to Git.
 
 See [installation and operation](DEPLOY_EN.md) for native builds and configuration.
 
-Online update checks, upgrades and rollback: [Version manager](UPDATES.md).
+Online update checks, upgrades and rollback: [Version manager](UPDATES.md). See [release files](RELEASES.md) for image tags and downloads.
 
 ## Administration console
 

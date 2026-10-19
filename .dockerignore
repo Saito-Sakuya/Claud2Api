@@ -12,3 +12,5 @@
 !THIRD_PARTY.md
 !LICENSES/
 !LICENSES/**
+!release/
+!release/claud2api-linux-amd64
