@@ -2,7 +2,7 @@
 
 中文 · [English](RELEASES.md) · [文档索引](DOCS_ZH.md)
 
-当前版本：**v0.1.0-alpha.6**。支持 Linux AMD64；以下版本均为 Alpha 预发行版。
+当前版本：**v0.1.0-alpha.7**。支持 Linux AMD64；以下版本均为 Alpha 预发行版。
 
 ## 版本区别
 
@@ -11,13 +11,15 @@
 
 - **alpha6**：每轮明确当前可用的原生工具名称，区分客户端与网页工具，纠正历史回复中“没有搜索工具”的误导。
 
+- **alpha7**：工具声明恢复中性，不因工具已启用或上一轮用过就要求再次调用；普通问题可直接回答，模型按当前任务选择工具。
+
 ## Docker 镜像
 
 ```sh
-docker pull ghcr.io/saito-sakuya/claud2api:0.1.0-alpha.6
+docker pull ghcr.io/saito-sakuya/claud2api:0.1.0-alpha.7
 ```
 
-alpha4 的固定标签为 `0.1.0-alpha.4`，alpha5 为 `0.1.0-alpha.5`，alpha6 为 `0.1.0-alpha.6`，也接受相同版本的 `v` 前缀标签。
+alpha4 的固定标签为 `0.1.0-alpha.4`，alpha5 为 `0.1.0-alpha.5`，alpha6 为 `0.1.0-alpha.6`，alpha7 为 `0.1.0-alpha.7`，也接受相同版本的 `v` 前缀标签。
 请固定具体版本；安装配置按 [README](README.md)。镜像直接使用同一 Release 的已校验二进制。
 
 ## 下载文件

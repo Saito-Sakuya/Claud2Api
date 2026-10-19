@@ -4,7 +4,7 @@
 
 <h1 align="center">Claud2Api</h1>
 
-<p align="center"><strong>v0.1.0-alpha.6</strong></p>
+<p align="center"><strong>v0.1.0-alpha.7</strong></p>
 
 <p align="center">
   <a href="DEPLOY_EN.md"><img src="docs/badges/linux-amd64.svg" alt="Supported platform: Linux AMD64" height="26" /></a>

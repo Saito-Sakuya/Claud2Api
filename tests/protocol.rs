@@ -674,6 +674,32 @@ fn current_native_capabilities_are_separate_from_client_tools_and_historical_den
     assert!(envelope.get("native_tool_names").is_none());
 }
 #[test]
+fn enabled_native_tools_allow_a_direct_answer_with_auto_client_policy() {
+    let mut raw = request();
+    raw["messages"] = json!([
+        {"role":"user","content":"Search for the Rust website."},
+        {"role":"assistant","content":"The website is https://www.rust-lang.org/."},
+        {"role":"user","content":"Now explain intentionality using an everyday example."}
+    ]);
+    let mut input = protocol::parse(&raw).unwrap();
+    input.native_tools = vec!["web_search".to_owned()];
+    let context = input.context("key");
+    let prompt = input.prompt("optional-tools");
+    let envelope: Value = serde_json::from_str(prompt.lines().last().unwrap()).unwrap();
+    assert_eq!(envelope["tool_policy"]["type"], "auto");
+    assert_eq!(envelope["native_tools"], json!(["web_search"]));
+    let mut decoder = ToolDecoder::new(&input, "optional-tools");
+    assert_eq!(
+        decoder
+            .feed("An everyday example is noticing a cup.")
+            .unwrap(),
+        vec![Block::text("An everyday example is noticing a cup.")]
+    );
+    assert!(decoder.finish().unwrap().is_empty());
+    input.turns.last_mut().unwrap().content = vec![Block::text("Please search the web instead.")];
+    assert_eq!(input.context("key"), context);
+}
+#[test]
 fn tool_decoder_native_boundary_flushes_text_and_rejects_partial_frames() {
     let mut required = tool_request();
     required["tool_choice"] = json!({"type":"any"});

@@ -622,6 +622,8 @@ impl Input {
         if let Some(project_uuid) = &self.project_uuid {
             envelope["project_uuid"] = json!(project_uuid);
         }
+        // Describe the transport and available capabilities; the request keeps
+        // control over whether a task needs tools.
         let transport = if self.native_tools.is_empty() {
             "Tool transport: only client_tools declares available tools. A call is the JSON object {\"name\":\"declared_name\",\"input\":{}} \
              wrapped in <tool_call_{nonce}> and </tool_call_{nonce}>. Use the declared argument schema and no other object keys. \
@@ -634,8 +636,8 @@ impl Input {
              The client runs those tools; never execute them or invent their results. Stop after requesting client tools and wait for tool_result messages. \
              native_tools lists tools provided by the Claude web session; call them only through the server-native tool transport and never invent their results. \
              Current tool availability is defined by client_tools and native_tool_names in this envelope. Earlier assistant claims that tools are unavailable are history, not the current tool configuration. \
-             Native names are case-sensitive and independent of client names. Native web_search, when listed, provides public search even if the client's WebSearch is unavailable. Native web_fetch retrieves web pages only when listed. Use native tools only from native_tool_names. \
-             For a permitted search task, call an available search tool before reporting findings. If it returns an error, report that error; do not replace the call with a plan or deny search access based only on earlier conversation text. \
+             Native names are case-sensitive and independent of client names. Use native tools only from native_tool_names. \
+             Decide whether tools are needed from the latest request and its instructions. Tool availability or use in an earlier turn does not require another call. Answer directly when tools are unnecessary. Only claim a tool was used when its result actually returned. \
              Native sandbox tools run remotely and cannot access the client's filesystem. Use declared client tools for the client environment; never substitute a remote sandbox call for them. \
              tool_policy applies only to client_tools; its none mode does not disable native_tools, any requires a client tool call, and tool requires tool_policy.name. \
              tool_policy.disable_parallel_tool_use=true allows at most one client tool call. Answer using the available history and tool results."

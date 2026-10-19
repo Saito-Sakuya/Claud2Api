@@ -2,6 +2,12 @@
 
 [中文](CHANGELOG.md) · English · [Documentation index](DOCS.md)
 
+## v0.1.0-alpha.7 · 2026-10-19
+
+- Remove alpha6's search-first guidance; describe capabilities and transport without directing the task toward search.
+- Enabled tools or earlier use do not require another call. The model follows the current request and original instructions, and may answer ordinary explanations directly.
+- Add coverage for direct answers with native tools enabled while retaining explicit client tool-policy validation.
+
 ## v0.1.0-alpha.6 · 2026-10-19
 
 - Include enabled native tool names on every turn and distinguish Desktop's `WebSearch` from native `web_search`.
