@@ -699,6 +699,7 @@ async fn start_completion(active: &mut Active) -> Result<()> {
                 parent: &active.parent,
                 model: &active.model,
                 prompt: &active.prompt,
+                uploads: &[],
                 tools: active.tool_descriptors.clone(),
                 thinking: &active.thinking,
             },
@@ -802,6 +803,7 @@ async fn pull_text(active: &mut Active, output: &mut String) -> Result<Pull> {
         let emissions = active.decoder.feed(&event)?;
         if event["type"] == "message_stop" {
             active.decoder.finish()?;
+            active.trace.native_observation_complete();
             active.upstream_done = true;
         }
         active.emissions.extend(emissions);
@@ -850,12 +852,24 @@ fn emission_to_pull(
             Ok(Pull::Citation(citation))
         }
         WebEmission::NativeStart(block) => {
+            if block["type"] == "tool_use" {
+                active.trace.native_start(
+                    block["id"].as_str().unwrap_or(""),
+                    block["name"].as_str().unwrap_or(""),
+                );
+            }
             Ok(Pull::NativeStart(crate::native_tools::sanitize(block)))
         }
         WebEmission::NativeDelta(delta) => {
             Ok(Pull::NativeDelta(crate::native_tools::sanitize(delta)))
         }
         WebEmission::NativeStop(block) => {
+            if block["type"] == "tool_result" {
+                active.trace.native_result(
+                    block["tool_use_id"].as_str().unwrap_or(""),
+                    block.get("is_error").and_then(Value::as_bool),
+                );
+            }
             let decorated = crate::native_files::decorate(
                 crate::native_tools::sanitize(block),
                 &active.engine.config.gateway_key,

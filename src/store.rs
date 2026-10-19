@@ -588,6 +588,14 @@ impl Store {
             if record.get("usage").is_none() {
                 record["usage"] = Value::Null;
             }
+            // Old status rows predate native-call auditing; keep them unknown
+            // instead of presenting them as observed zero-call requests.
+            if record.get("native_tools").is_none() {
+                record["native_tools"] = Value::Null;
+            }
+            if record.get("native_tools_complete").is_none() {
+                record["native_tools_complete"] = Value::Null;
+            }
             record["seq"] = json!(seq);
             records.push(record);
         }
@@ -976,6 +984,20 @@ mod tests {
             accounts: vec![],
             settings: Settings::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn old_status_logs_keep_native_activity_and_completeness_unknown() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&config(&data_dir)).await.unwrap();
+        sqlx::query("INSERT INTO protocol_logs(id,at,account_id,level,finished_at,data) VALUES(?,?,?,?,?,?)")
+            .bind("legacy-status").bind(now()).bind("").bind("normal").bind(now())
+            .bind(r#"{"direction":"downstream","status":200}"#)
+            .execute(&store.db).await.unwrap();
+        let logs = store.status_logs("all", "", None, 10).await.unwrap();
+        let record = &logs["records"][0];
+        assert_eq!(record.get("native_tools"), Some(&Value::Null));
+        assert_eq!(record.get("native_tools_complete"), Some(&Value::Null));
     }
 
     #[tokio::test]

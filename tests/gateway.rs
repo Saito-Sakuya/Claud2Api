@@ -6,6 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use claud2api::{
     config::{Config, Credential, Settings},
     control,
@@ -18,15 +19,215 @@ use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tower::ServiceExt;
+
+const MEDIA_PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+fn media_image() -> Value {
+    json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":MEDIA_PNG}})
+}
+
+fn media_request() -> Value {
+    let mut request = base();
+    request["messages"][0]["content"] =
+        json!([media_image(),{"type":"text","text":"Read this image."}]);
+    request
+}
+
+#[tokio::test]
+async fn images_reach_upstream_as_binary_files_and_continue_without_reuploading_history() {
+    let f = fixture(1).await;
+    let mut request = media_request();
+    let (status, headers, first) = call(
+        &f.engine,
+        "/v1/messages",
+        request.clone(),
+        Some("media-continuation"),
+    )
+    .await;
+    assert_eq!(status, 200, "{first}");
+    let id = headers["x-c2a-session-id"].to_str().unwrap().to_owned();
+    {
+        let uploaded = f.upstream.uploaded.lock().await;
+        assert_eq!(uploaded.len(), 1);
+        assert_eq!(
+            uploaded[0]["data_hex"],
+            hex::encode(STANDARD.decode(MEDIA_PNG).unwrap())
+        );
+        assert_eq!(uploaded[0]["media_type"], "image/png");
+        assert_eq!(uploaded[0]["field_file"], true);
+    }
+    let messages = request["messages"].as_array_mut().unwrap();
+    messages.push(json!({"role":"assistant","content":first["content"]}));
+    messages.push(json!({"role":"user","content":"Continue using the previous image."}));
+    reset_pacing(&f.engine).await;
+    let (status, continued_headers, continued) =
+        call(&f.engine, "/v1/messages", request, Some(&id)).await;
+    assert_eq!(status, 200, "{continued}");
+    assert_eq!(continued_headers["x-c2a-session-id"], id);
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 1);
+    assert_eq!(f.upstream.uploaded.lock().await.len(), 1);
+    let traces = f.upstream.traces.lock().await;
+    let calls = completion_requests(&traces);
+    assert_eq!(calls[0]["body"]["files"].as_array().unwrap().len(), 1);
+    assert!(
+        calls[0]["body"]["files"][0]
+            .as_str()
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+    );
+    assert_eq!(calls[1]["body"]["files"], json!([]));
+    assert!(
+        !calls[0]["body"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains(MEDIA_PNG)
+    );
+    assert!(
+        traces
+            .iter()
+            .filter(|trace| trace["uri"].as_str().unwrap().ends_with("/upload"))
+            .all(|trace| trace["cookie"].as_str().unwrap().contains("fake-session-0"))
+    );
+    drop(traces);
+    let logs = logs_for_request(&f.engine, headers["x-request-id"].to_str().unwrap()).await;
+    assert!(
+        logs.iter()
+            .any(|log| log["operation"] == "file_upload" && log["status"] == 200)
+    );
+}
+
+#[tokio::test]
+async fn quota_migration_reuploads_image_history_using_the_new_account() {
+    let f = fixture(2).await;
+    let mut request = media_request();
+    let (status, headers, first) = call(
+        &f.engine,
+        "/v1/messages",
+        request.clone(),
+        Some("media-migrate"),
+    )
+    .await;
+    assert_eq!(status, 200, "{first}");
+    let id = headers["x-c2a-session-id"].to_str().unwrap().to_owned();
+    let old = f.engine.store.read().await.sessions[&id].clone();
+    f.engine
+        .pool
+        .observe(&old.account_id, 429, None)
+        .await
+        .unwrap();
+    request["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":first["content"]}),
+        json!({"role":"user","content":"Use the previous image again."}),
+    ]);
+    let (status, _, out) = call(&f.engine, "/v1/messages", request, Some(&id)).await;
+    assert_eq!(status, 200, "{out}");
+    assert_ne!(
+        f.engine.store.read().await.sessions[&id].account_id,
+        old.account_id
+    );
+    let traces = f.upstream.traces.lock().await;
+    let uploads: Vec<_> = traces
+        .iter()
+        .filter(|trace| trace["uri"].as_str().unwrap().ends_with("/upload"))
+        .collect();
+    assert_eq!(uploads.len(), 2);
+    assert_ne!(uploads[0]["cookie"], uploads[1]["cookie"]);
+    let calls = completion_requests(&traces);
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["body"]["files"].as_array().unwrap().len(), 1);
+    assert_eq!(calls[1]["body"]["files"].as_array().unwrap().len(), 1);
+    assert_ne!(calls[0]["body"]["files"], calls[1]["body"]["files"]);
+}
+
+#[tokio::test]
+async fn pdf_and_tool_images_keep_file_ids_while_text_documents_are_inline_attachments() {
+    let f = fixture(1).await;
+    let image_id = "11111111-1111-4111-8111-111111111111";
+    let pdf_id = "22222222-2222-4222-8222-222222222222";
+    f.upstream.upload_replies.lock().await.extend([
+        json!({"file_uuid":image_id,"file_kind":"image"}),
+        json!({"file_uuid":pdf_id,"file_kind":"document","extracted_content":"PDF preview is not the visual file."})
+    ]);
+    let mut request = base();
+    request["tools"] = json!([{"name":"Read","input_schema":{"type":"object"}}]);
+    request["messages"] = json!([
+        {"role":"user","content":"Read the image and documents."},
+        {"role":"assistant","content":[{"type":"tool_use","id":"read-media","name":"Read","input":{}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"read-media","content":[
+            media_image(),
+            {"type":"document","title":"document.pdf","source":{"type":"base64","media_type":"application/pdf","data":STANDARD.encode(b"%PDF-1.4\nfixture content")}},
+            {"type":"document","title":"notes.txt","source":{"type":"text","media_type":"text/plain","data":"PRIVATE_TEXT_DOCUMENT_1234"}}
+        ]}]}
+    ]);
+    let (status, _, out) = call(&f.engine, "/v1/messages", request, None).await;
+    assert_eq!(status, 200, "{out}");
+    assert_eq!(f.upstream.uploaded.lock().await.len(), 2);
+    let traces = f.upstream.traces.lock().await;
+    let calls = completion_requests(&traces);
+    assert_eq!(calls[0]["body"]["files"], json!([image_id, pdf_id]));
+    let attachments = calls[0]["body"]["attachments"].as_array().unwrap();
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(
+        attachments[0]["extracted_content"],
+        "PRIVATE_TEXT_DOCUMENT_1234"
+    );
+    assert!(
+        attachments[0]["file_name"]
+            .as_str()
+            .unwrap()
+            .starts_with("notes")
+    );
+    assert_eq!(attachments[0]["file_type"], "text/plain");
+    assert!(
+        !calls[0]["body"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("PRIVATE_TEXT_DOCUMENT_1234")
+    );
+}
+
+#[tokio::test]
+async fn invalid_upload_results_and_http_errors_never_start_generation() {
+    for response in [
+        json!({"type":"error","file_kind":"image","file_uuid":"11111111-1111-4111-8111-111111111111"}),
+        json!({"file_kind":"image","file_uuid":"not-a-uuid"}),
+        json!({"file_uuid":"11111111-1111-4111-8111-111111111111"}),
+    ] {
+        let f = fixture(1).await;
+        f.upstream.upload_replies.lock().await.push_back(response);
+        let (status, _, out) = call(&f.engine, "/v1/messages", media_request(), None).await;
+        assert_eq!(status, 502, "{out}");
+        assert!(completion_requests(&f.upstream.traces.lock().await).is_empty());
+        assert!(!out.to_string().contains(MEDIA_PNG));
+    }
+    let f = fixture(1).await;
+    f.upstream.upload_status.store(400, Ordering::SeqCst);
+    let (status, _, out) = call(&f.engine, "/v1/messages", media_request(), None).await;
+    assert_eq!(status, 400, "{out}");
+    assert!(completion_requests(&f.upstream.traces.lock().await).is_empty());
+}
+
+#[tokio::test]
+async fn media_reference_limits_fail_before_account_or_upstream_admission() {
+    let f = fixture(1).await;
+    let mut request = base();
+    request["messages"][0]["content"] = json!((0..21).map(|index|json!({
+        "type":"document","title":format!("file-{index}.txt"),"source":{"type":"text","data":"same content"}
+    })).collect::<Vec<_>>());
+    let (status, _, _) = call(&f.engine, "/v1/messages", request, None).await;
+    assert_eq!(status, 400);
+    assert!(f.upstream.traces.lock().await.is_empty());
+    assert!(f.engine.store.read().await.sessions.is_empty());
+}
 
 struct Fixture {
     engine: Arc<Engine>,
@@ -44,6 +245,11 @@ struct Upstream {
     streams: Arc<AtomicUsize>,
     catalog_status: AtomicUsize,
     catalog_models: Mutex<Option<Vec<String>>>,
+    stop_response_status: AtomicUsize,
+    uploaded: Mutex<Vec<Value>>,
+    upload_replies: Mutex<VecDeque<Value>>,
+    upload_status: AtomicUsize,
+    client_tool_waiters: Mutex<HashMap<String, oneshot::Sender<Value>>>,
 }
 enum Reply {
     Text(String),
@@ -54,6 +260,7 @@ enum Reply {
     Truncated,
     Slow,
     Summary(String),
+    ClientTool { input: Value, final_text: String },
     Raw(String),
 }
 impl Drop for Fixture {
@@ -175,6 +382,42 @@ async fn mock(State(state): State<Arc<Upstream>>, request: Request) -> Response 
             });
         return axum::Json(json!({"claude_ai_available_models":{"models":models.iter().map(|id|json!({"model_id":id})).collect::<Vec<_>>()}})).into_response();
     }
+    if method == "POST" && path == "/api/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/upload" {
+        let content_type = headers.get("content-type").unwrap().to_str().unwrap();
+        let boundary = content_type.split("boundary=").nth(1).unwrap();
+        let split = body
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap();
+        let multipart_headers = std::str::from_utf8(&body[..split]).unwrap();
+        let filename = multipart_headers
+            .split("filename=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let media_type = multipart_headers
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Type: "))
+            .unwrap();
+        let ending = format!("\r\n--{boundary}--\r\n");
+        assert!(body.ends_with(ending.as_bytes()));
+        let data = &body[split + 4..body.len() - ending.len()];
+        state.uploaded.lock().await.push(json!({
+            "filename":filename,"media_type":media_type,"data_hex":hex::encode(data),
+            "field_file":multipart_headers.contains("name=\"file\""),
+        }));
+        let status = state.upload_status.load(Ordering::SeqCst);
+        if status != 0 {
+            return StatusCode::from_u16(status as u16).unwrap().into_response();
+        }
+        let reply = state.upload_replies.lock().await.pop_front().unwrap_or_else(||json!({
+            "file_uuid":store::uuid(),"file_kind":if media_type.starts_with("image/"){"image"}else{"document"},
+            "file_name":filename,"file_type":media_type,"file_size":data.len()
+        }));
+        return axum::Json(reply).into_response();
+    }
     if method == "DELETE" {
         state.deleted.fetch_add(1, Ordering::SeqCst);
         return StatusCode::NO_CONTENT.into_response();
@@ -196,6 +439,22 @@ async fn mock(State(state): State<Arc<Upstream>>, request: Request) -> Response 
     if path.ends_with("/chat_conversations") {
         state.created.fetch_add(1, Ordering::SeqCst);
         return axum::Json(json!({"uuid":store::uuid()})).into_response();
+    }
+    if method == "POST" && path.ends_with("/tool_result") {
+        let tool_id = json_body["tool_use_id"].as_str().unwrap_or_default();
+        if let Some(sender) = state.client_tool_waiters.lock().await.remove(tool_id) {
+            let _ = sender.send(json_body);
+            return axum::Json(json!({"type":"ok"})).into_response();
+        }
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if method == "POST" && path.ends_with("/stop_response") {
+        let status = state.stop_response_status.load(Ordering::SeqCst);
+        return if status == 0 {
+            StatusCode::NO_CONTENT.into_response()
+        } else {
+            StatusCode::from_u16(status as u16).unwrap().into_response()
+        };
     }
     if path.ends_with("/completion") {
         let reply = state
@@ -247,6 +506,61 @@ async fn mock(State(state): State<Arc<Upstream>>, request: Request) -> Response 
             }
             Reply::Text(text) | Reply::Summary(text) => text_events(&text),
             Reply::Raw(text) => text,
+            Reply::ClientTool { input, final_text } => {
+                let wire_name = json_body["tools"]
+                    .as_array()
+                    .and_then(|tools| {
+                        tools.iter().find(|tool| {
+                            tool["name"]
+                                .as_str()
+                                .is_some_and(|name| name.starts_with("c2a_client_"))
+                        })
+                    })
+                    .and_then(|tool| tool["name"].as_str())
+                    .unwrap_or("c2a_client_fixture")
+                    .to_owned();
+                let upstream_tool_id = "toolu_upstream_client_fixture".to_owned();
+                let (sender, receiver) = oneshot::channel();
+                state
+                    .client_tool_waiters
+                    .lock()
+                    .await
+                    .insert(upstream_tool_id.clone(), sender);
+                let output = async_stream::stream! {
+                    let events = [
+                        json!({"type":"message_start"}),
+                        json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":upstream_tool_id,"name":wire_name,"input":{}}}),
+                        json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":input.to_string()}}),
+                        json!({"type":"content_block_stop","index":0}),
+                        json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+                    ];
+                    for value in events {
+                        yield Ok::<_, std::convert::Infallible>(Bytes::from(event(value)));
+                    }
+
+                    // Claude's sidechannel POST releases this still-open completion.
+                    let result = receiver.await.unwrap_or(Value::Null);
+                    let result_content = result.get("content").cloned().unwrap_or_else(|| json!([]));
+                    let is_error = result.get("is_error").cloned().unwrap_or(json!(false));
+                    let continuation = [
+                        json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_result","tool_use_id":upstream_tool_id,"name":wire_name,"content":result_content,"is_error":is_error}}),
+                        json!({"type":"content_block_stop","index":1}),
+                        json!({"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}),
+                        json!({"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":final_text}}),
+                        json!({"type":"content_block_stop","index":2}),
+                        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+                        json!({"type":"message_stop"}),
+                    ];
+                    for value in continuation {
+                        yield Ok(Bytes::from(event(value)));
+                    }
+                };
+                return (
+                    [("content-type", "text/event-stream")],
+                    Body::from_stream(output),
+                )
+                    .into_response();
+            }
             Reply::Slow => {
                 let streams = state.streams.clone();
                 streams.fetch_add(1, Ordering::SeqCst);
@@ -270,7 +584,7 @@ async fn mock(State(state): State<Arc<Upstream>>, request: Request) -> Response 
     StatusCode::NOT_FOUND.into_response()
 }
 fn base() -> Value {
-    json!({"model":"test","max_tokens":128,"messages":[{"role":"user","content":"hello"}]})
+    json!({"model":"test","max_tokens":128,"claud2api_native_output":"extensions","messages":[{"role":"user","content":"hello"}]})
 }
 fn default_native_descriptors() -> Value {
     let mut descriptors = vec![
@@ -435,6 +749,68 @@ fn completion_requests(traces: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+fn assert_stop_before_replacement_completion_with_count(
+    traces: &[Value],
+    replacement_index: usize,
+    expected_stop_count: usize,
+) {
+    let completion_indices: Vec<_> = traces
+        .iter()
+        .enumerate()
+        .filter(|(_, trace)| {
+            trace["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.ends_with("/completion"))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert!(completion_indices.len() > replacement_index);
+    let stop_indices: Vec<_> = traces
+        .iter()
+        .enumerate()
+        .filter(|(_, trace)| {
+            trace["method"] == "POST"
+                && trace["uri"]
+                    .as_str()
+                    .is_some_and(|uri| uri.ends_with("/stop_response"))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        stop_indices.len(),
+        expected_stop_count,
+        "fresh rebuild must stop its old stream the expected number of times"
+    );
+    let first_completion = traces[completion_indices[0]]["uri"]
+        .as_str()
+        .unwrap()
+        .strip_suffix("/completion")
+        .unwrap();
+    for stop_index in &stop_indices {
+        assert_eq!(
+            traces[*stop_index]["uri"],
+            format!("{first_completion}/stop_response"),
+            "stop_response must target the original conversation"
+        );
+    }
+    assert!(
+        stop_indices
+            .iter()
+            .all(|index| *index < completion_indices[replacement_index]),
+        "old stream must be stopped before starting the replacement completion"
+    );
+}
+
+fn assert_stop_before_replacement_completion(traces: &[Value], replacement_index: usize) {
+    assert_stop_before_replacement_completion_with_count(traces, replacement_index, 1);
+}
+
+fn assert_fresh_stop_before_rebuild(traces: &[Value]) {
+    let completions = completion_requests(traces);
+    assert_eq!(completions.len(), 2);
+    assert_stop_before_replacement_completion(traces, 1);
+}
+
 #[tokio::test]
 async fn native_tool_selection_forwards_descriptors_and_honors_admin_caps() {
     let f = fixture(1).await;
@@ -507,6 +883,1594 @@ async fn native_tool_selection_forwards_descriptors_and_honors_admin_caps() {
     let (status, _, body) = call(&f.engine, "/v1/messages", disabled_project, None).await;
     assert_eq!(status, 400, "{body}");
     assert!(f.upstream.traces.lock().await.is_empty());
+}
+
+fn synthetic_client_tool_request(choice: Value, stream: bool) -> Value {
+    let mut request = base();
+    request["stream"] = json!(stream);
+    request["tool_choice"] = choice;
+    request["tools"] = json!([{
+        "name":"synthetic_echo",
+        "description":"Echo a synthetic value.",
+        "input_schema":{
+            "type":"object",
+            "properties":{"value":{"type":"string"}},
+            "required":["value"],
+            "additionalProperties":false
+        }
+    }]);
+    request["messages"][0]["content"] = json!("Call synthetic_echo with the marker.");
+    request
+}
+
+async fn start_synthetic_client_tool(
+    f: &Fixture,
+    request: Value,
+    identity: &str,
+) -> (String, Value) {
+    let (status, headers, response) =
+        call(&f.engine, "/v1/messages", request, Some(identity)).await;
+    assert_eq!(status, 200, "{response}");
+    let handle = headers["x-c2a-session-id"].to_str().unwrap().to_owned();
+    let tool_call = response["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|block| block["type"] == "tool_use")
+        .expect("the initial generation should request a client tool")
+        .clone();
+    (handle, tool_call)
+}
+
+fn append_client_tool_result(
+    request: &mut Value,
+    tool_call: &Value,
+    result_content: Value,
+    following_user_text: Option<&str>,
+) {
+    let mut content = vec![json!({
+        "type":"tool_result",
+        "tool_use_id":tool_call["id"],
+        "content":result_content
+    })];
+    if let Some(text) = following_user_text {
+        content.push(json!({"type":"text","text":text}));
+    }
+    request["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":[tool_call.clone()]}),
+        json!({"role":"user","content":content}),
+    ]);
+}
+
+async fn assert_client_tool_choice_can_switch_to_auto(choice: Value, stream: bool) {
+    let f = fixture(1).await;
+    let input = json!({"value":"choice marker"});
+    f.upstream
+        .replies
+        .lock()
+        .await
+        .push_back(Reply::ClientTool {
+            input: input.clone(),
+            final_text: "choice continuation completed".to_owned(),
+        });
+    let mut request = synthetic_client_tool_request(choice, stream);
+    let (status, headers, first) = call(
+        &f.engine,
+        "/v1/messages",
+        request.clone(),
+        Some("client-tool-choice-switch"),
+    )
+    .await;
+    assert_eq!(status, 200, "{first}");
+    let (tool_call, reason) = if stream {
+        let events = sse_values(first.as_str().unwrap());
+        let events = events.as_array().unwrap();
+        let start = events
+            .iter()
+            .find(|event| {
+                event["type"] == "content_block_start"
+                    && event["content_block"]["type"] == "tool_use"
+            })
+            .unwrap();
+        let index = start["index"].as_u64().unwrap();
+        let partial = events
+            .iter()
+            .filter(|event| {
+                event["type"] == "content_block_delta"
+                    && event["index"] == index
+                    && event["delta"]["type"] == "input_json_delta"
+            })
+            .filter_map(|event| event["delta"]["partial_json"].as_str())
+            .collect::<String>();
+        let start = &start["content_block"];
+        (
+            json!({
+                "type":"tool_use","id":start["id"],"name":start["name"],
+                "input":serde_json::from_str::<Value>(&partial).unwrap()
+            }),
+            events
+                .iter()
+                .find(|event| event["type"] == "message_delta")
+                .unwrap()["delta"]["stop_reason"]
+                .clone(),
+        )
+    } else {
+        (
+            first["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|block| block["type"] == "tool_use")
+                .unwrap()
+                .clone(),
+            first["stop_reason"].clone(),
+        )
+    };
+    assert_eq!(reason, "tool_use");
+    assert!(tool_call["id"].as_str().unwrap().starts_with("toolu_c2a_"));
+    assert_eq!(tool_call["name"], "synthetic_echo");
+    assert_eq!(tool_call["input"], input);
+
+    request["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":[tool_call.clone()]}),
+        json!({"role":"user","content":[{
+            "type":"tool_result","tool_use_id":tool_call["id"],"content":"choice result"
+        }]}),
+    ]);
+    request["tool_choice"] = json!({"type":"auto"});
+    let handle = headers["x-c2a-session-id"].to_str().unwrap().to_owned();
+    let (status, _, resumed) = call(&f.engine, "/v1/messages", request, Some(&handle)).await;
+    assert_eq!(status, 200, "{resumed}");
+    let text = if stream {
+        sse_values(resumed.as_str().unwrap())
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|event| {
+                (event["type"] == "content_block_delta")
+                    .then(|| event["delta"]["text"].as_str())
+                    .flatten()
+            })
+            .collect::<String>()
+    } else {
+        resumed["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<String>()
+    };
+    assert_eq!(text, "choice continuation completed");
+    let traces = f.upstream.traces.lock().await;
+    assert_eq!(completion_requests(&traces).len(), 1);
+    assert_eq!(
+        traces
+            .iter()
+            .filter(|trace| trace["uri"].as_str().unwrap().ends_with("/tool_result"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn client_tool_choice_any_and_named_tool_can_resume_with_auto() {
+    assert_client_tool_choice_can_switch_to_auto(json!({"type":"any"}), false).await;
+    assert_client_tool_choice_can_switch_to_auto(
+        json!({"type":"tool","name":"synthetic_echo"}),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn tool_choice_none_after_client_tool_starts_fresh_tool_free_completion() {
+    let f = fixture(1).await;
+    f.upstream.replies.lock().await.extend([
+        Reply::ClientTool {
+            input: json!({"value":"pending marker"}),
+            final_text: "must not resume the pending completion".to_owned(),
+        },
+        Reply::Text("finished without tools".to_owned()),
+    ]);
+
+    let mut request = synthetic_client_tool_request(json!({"type":"auto"}), false);
+    let (status, first_headers, first) = call(
+        &f.engine,
+        "/v1/messages",
+        request.clone(),
+        Some("tool-choice-none-after-pending"),
+    )
+    .await;
+    assert_eq!(status, 200, "{first}");
+    let handle = first_headers["x-c2a-session-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let first_tool = first["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|block| block["type"] == "tool_use")
+        .expect("first generation should request the declared client tool")
+        .clone();
+    assert_eq!(first_tool["name"], "synthetic_echo");
+    assert_eq!(first_tool["input"], json!({"value":"pending marker"}));
+
+    request["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":[first_tool.clone()]}),
+        json!({"role":"user","content":[{
+            "type":"tool_result","tool_use_id":first_tool["id"],
+            "content":"synthetic result must be preserved in history"
+        }]}),
+    ]);
+    request["tool_choice"] = json!({"type":"none"});
+    let (status, second_headers, second) =
+        call(&f.engine, "/v1/messages", request, Some(&handle)).await;
+    assert_eq!(status, 200, "{second}");
+    assert_eq!(second_headers["x-c2a-session-id"], handle);
+    assert_eq!(second["stop_reason"], "end_turn");
+    assert_eq!(second["content"].as_array().unwrap().len(), 1);
+    assert_eq!(second["content"][0]["type"], "text");
+    assert_eq!(second["content"][0]["text"], "finished without tools");
+    assert!(
+        second["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| { !matches!(block["type"].as_str(), Some("tool_use" | "tool_result")) })
+    );
+
+    let traces = f.upstream.traces.lock().await;
+    let completions = completion_requests(&traces);
+    assert_eq!(completions.len(), 2);
+    assert_fresh_stop_before_rebuild(&traces);
+    assert!(
+        default_native_descriptors()
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|descriptor| completions[0]["body"]["tools"]
+                .as_array()
+                .unwrap()
+                .contains(descriptor))
+    );
+    assert!(
+        completions[0]["body"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("c2a_client_")))
+    );
+    assert_eq!(completions[1]["body"]["tools"], json!([]));
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        traces
+            .iter()
+            .filter(|trace| trace["method"] == "POST"
+                && trace["uri"].as_str().unwrap().ends_with("/tool_result"))
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn client_pdf_result_rebuilds_with_real_upload_and_preserves_validated_history() {
+    let f = fixture(1).await;
+    let pdf_bytes = b"%PDF-1.4\nsynthetic client tool PDF";
+    let encoded_pdf = STANDARD.encode(pdf_bytes);
+    let pdf_id = "33333333-3333-4333-8333-333333333333";
+    f.upstream.upload_replies.lock().await.push_back(json!({
+        "file_uuid":pdf_id,
+        "file_kind":"document",
+        "extracted_content":"Synthetic PDF preview; uploaded bytes remain authoritative."
+    }));
+    f.upstream.replies.lock().await.extend([
+        Reply::ClientTool {
+            input: json!({"value":"read the returned PDF"}),
+            final_text: "must not resume the unsupported PDF result post".to_owned(),
+        },
+        Reply::Text("finished after reading the client PDF".to_owned()),
+    ]);
+
+    let mut request = synthetic_client_tool_request(json!({"type":"auto"}), false);
+    request["messages"][0]["content"] = json!("Read the PDF returned by the client tool.");
+    let (status, first_headers, first) = call(
+        &f.engine,
+        "/v1/messages",
+        request.clone(),
+        Some("client-pdf-tool-result-rebuild"),
+    )
+    .await;
+    assert_eq!(status, 200, "{first}");
+    let handle = first_headers["x-c2a-session-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let tool_call = first["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|block| block["type"] == "tool_use")
+        .expect("first generation should request the declared client tool")
+        .clone();
+
+    request["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":[tool_call.clone()]}),
+        json!({"role":"user","content":[{
+            "type":"tool_result",
+            "tool_use_id":tool_call["id"],
+            "content":[
+                {"type":"text","text":"The requested file is attached."},
+                {"type":"document","title":"client-result.pdf","source":{
+                    "type":"base64","media_type":"application/pdf","data":encoded_pdf
+                }}
+            ]
+        }]}),
+    ]);
+    let (status, second_headers, second) =
+        call(&f.engine, "/v1/messages", request, Some(&handle)).await;
+    assert_eq!(status, 200, "{second}");
+    assert_eq!(second_headers["x-c2a-session-id"], handle);
+    assert_eq!(second["stop_reason"], "end_turn");
+    assert_eq!(second["content"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        second["content"][0]["text"],
+        "finished after reading the client PDF"
+    );
+
+    let uploaded = f.upstream.uploaded.lock().await;
+    assert_eq!(uploaded.len(), 1);
+    assert_eq!(uploaded[0]["media_type"], "application/pdf");
+    let uploaded_filename = uploaded[0]["filename"].as_str().unwrap().to_owned();
+    assert!(uploaded_filename.starts_with("client-result-"));
+    assert!(uploaded_filename.ends_with(".pdf"));
+    assert_eq!(uploaded[0]["data_hex"], hex::encode(pdf_bytes));
+    drop(uploaded);
+
+    let traces = f.upstream.traces.lock().await;
+    let completions = completion_requests(&traces);
+    assert_eq!(completions.len(), 2);
+    assert_fresh_stop_before_rebuild(&traces);
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 2);
+    assert_eq!(completions[0]["body"]["files"], json!([]));
+    assert_eq!(completions[1]["body"]["files"], json!([pdf_id]));
+    let prompt = completions[1]["body"]["prompt"].as_str().unwrap();
+    let envelope = prompt
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value.get("history").is_some())
+        .expect("fresh completion should receive the full validated history envelope");
+    let history = envelope["history"].as_array().unwrap();
+    let returned_result = &history.last().unwrap()["content"][0];
+    assert_eq!(returned_result["type"], "tool_result");
+    assert_eq!(returned_result["content"][1]["type"], "attachment");
+    assert_eq!(
+        returned_result["content"][1]["file"]["filename"],
+        uploaded_filename
+    );
+    assert_eq!(
+        returned_result["content"][1]["file"]["media_type"],
+        "application/pdf"
+    );
+    assert!(!prompt.contains(&STANDARD.encode(pdf_bytes)));
+    assert_eq!(
+        traces
+            .iter()
+            .filter(|trace| trace["method"] == "POST"
+                && trace["uri"].as_str().unwrap().ends_with("/tool_result"))
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn dropping_client_tool_sse_retires_waiting_session_and_releases_account() {
+    let f = fixture(1).await;
+    f.upstream
+        .replies
+        .lock()
+        .await
+        .push_back(Reply::ClientTool {
+            input: json!({"value":"cancel marker"}),
+            final_text: "must not be delivered".to_owned(),
+        });
+    let request = synthetic_client_tool_request(json!({"type":"auto"}), true);
+    let account_id = f
+        .engine
+        .store
+        .read()
+        .await
+        .accounts
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let response = web::public(f.engine.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("x-api-key", &f.engine.config.gateway_key)
+                .header("x-c2a-session-id", "client-tool-aborted-stream")
+                .header("content-type", "application/json")
+                .body(Body::from(request.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let handle = response
+        .headers()
+        .get("x-c2a-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let mut body = response.into_body();
+    let mut saw_tool_use = false;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(frame) = body.frame().await {
+            let frame = frame.unwrap();
+            if let Ok(chunk) = frame.into_data() {
+                let text = String::from_utf8_lossy(&chunk);
+                for data in text.lines().filter_map(|line| line.strip_prefix("data: ")) {
+                    let event: Value = serde_json::from_str(data).unwrap();
+                    assert_ne!(event["type"], "message_stop");
+                    if event["type"] == "content_block_start"
+                        && event["content_block"]["type"] == "tool_use"
+                    {
+                        saw_tool_use = true;
+                        break;
+                    }
+                }
+                if saw_tool_use {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("first client tool_use should arrive promptly");
+    assert!(saw_tool_use);
+    drop(body);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let session_removed = !f.engine.store.read().await.sessions.contains_key(&handle);
+            let account_released = !f.engine.pool.busy(&account_id).await;
+            if session_removed && account_released {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping the SSE should retire the wait and release the account");
+    let traces = f.upstream.traces.lock().await;
+    assert_eq!(completion_requests(&traces).len(), 1);
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 1);
+    assert!(traces.iter().all(|trace| {
+        !trace["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.ends_with("/tool_result"))
+    }));
+}
+
+#[tokio::test]
+async fn client_tool_roundtrip_resumes_the_same_completion_over_the_sidechannel() {
+    let f = fixture(1).await;
+    let input = json!({"value":"synthetic marker"});
+    let result_text = "synthetic echo result marker";
+    let final_text = "continued from the same completion";
+    f.upstream
+        .replies
+        .lock()
+        .await
+        .push_back(Reply::ClientTool {
+            input: input.clone(),
+            final_text: final_text.to_owned(),
+        });
+
+    let mut request = base();
+    request["stream"] = json!(true);
+    request["tools"] = json!([{
+        "name":"synthetic_echo",
+        "description":"Echo the supplied synthetic value.",
+        "input_schema":{
+            "type":"object",
+            "properties":{"value":{"type":"string"}},
+            "required":["value"],
+            "additionalProperties":false
+        }
+    }]);
+    request["messages"][0]["content"] = json!("Call synthetic_echo with the marker.");
+
+    let (status, headers, first) = call(
+        &f.engine,
+        "/v1/messages",
+        request.clone(),
+        Some("client-tool-roundtrip"),
+    )
+    .await;
+    assert_eq!(status, 200, "{first}");
+    let handle = headers["x-c2a-session-id"].to_str().unwrap().to_owned();
+    let first_events = sse_values(first.as_str().expect("streaming response body"));
+    let first_events = first_events.as_array().expect("SSE events");
+    let tool_start = first_events
+        .iter()
+        .find(|event| {
+            event["type"] == "content_block_start" && event["content_block"]["type"] == "tool_use"
+        })
+        .expect("downstream client tool_use");
+    let tool_call = &tool_start["content_block"];
+    let public_id = tool_call["id"].as_str().expect("public tool id");
+    assert!(public_id.starts_with("toolu_c2a_"));
+    assert_eq!(tool_call["name"], "synthetic_echo");
+    let partial_json = first_events
+        .iter()
+        .filter(|event| event["type"] == "content_block_delta")
+        .filter_map(|event| {
+            (event["delta"]["type"] == "input_json_delta")
+                .then(|| event["delta"]["partial_json"].as_str())
+                .flatten()
+        })
+        .collect::<String>();
+    assert_eq!(serde_json::from_str::<Value>(&partial_json).unwrap(), input);
+    assert!(first_events.iter().any(|event| {
+        event["type"] == "message_delta" && event["delta"]["stop_reason"] == "tool_use"
+    }));
+
+    request["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":[{
+            "type":"tool_use","id":public_id,"name":"synthetic_echo","input":input
+        }]}),
+        json!({"role":"user","content":[{
+            "type":"tool_result","tool_use_id":public_id,"content":result_text,"is_error":false
+        }]}),
+    ]);
+    request["tool_choice"] = json!({"type":"auto"});
+    let resumed_request = request.clone();
+
+    let mut changed_input = resumed_request.clone();
+    changed_input["messages"][1]["content"][0]["input"]["value"] = json!("tampered marker");
+    let (status, _, rejected) = call(&f.engine, "/v1/messages", changed_input, Some(&handle)).await;
+    assert_eq!(
+        status, 409,
+        "changed tool arguments must be rejected: {rejected}"
+    );
+
+    let mut changed_id = resumed_request.clone();
+    changed_id["messages"][1]["content"][0]["id"] = json!("toolu_c2a_wrong_id");
+    changed_id["messages"][2]["content"][0]["tool_use_id"] = json!("toolu_c2a_wrong_id");
+    let (status, _, rejected) = call(&f.engine, "/v1/messages", changed_id, Some(&handle)).await;
+    assert_eq!(
+        status, 409,
+        "changed public tool id must be rejected: {rejected}"
+    );
+
+    let (_, other_token) = managed_token(&f.engine, 1).await;
+    let (status, _, rejected) = call_key(
+        &f.engine,
+        "/v1/messages",
+        resumed_request.clone(),
+        Some(&handle),
+        &other_token,
+    )
+    .await;
+    assert_eq!(
+        status, 403,
+        "a different token must not resume the parked tool: {rejected}"
+    );
+
+    let (status, second_headers, second) =
+        call(&f.engine, "/v1/messages", request, Some(&handle)).await;
+    assert_eq!(status, 200, "{second}");
+    assert_eq!(second_headers["x-c2a-session-id"], handle);
+    let second_events = sse_values(second.as_str().expect("streaming response body"));
+    let continued_text = second_events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| {
+            (event["type"] == "content_block_delta")
+                .then(|| event["delta"]["text"].as_str())
+                .flatten()
+        })
+        .collect::<String>();
+    assert_eq!(continued_text, final_text);
+    assert!(second_events.as_array().unwrap().iter().any(|event| {
+        event["type"] == "message_delta" && event["delta"]["stop_reason"] == "end_turn"
+    }));
+
+    let (status, _, replay) = call(&f.engine, "/v1/messages", resumed_request, Some(&handle)).await;
+    assert_eq!(
+        status, 409,
+        "a completed client result must not be replayed: {replay}"
+    );
+
+    let traces = f.upstream.traces.lock().await;
+    let completions = completion_requests(&traces);
+    assert_eq!(completions.len(), 1, "continuation must not generate again");
+    assert!(traces.iter().all(|trace| {
+        !trace["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.ends_with("/stop_response"))
+    }));
+    let tool_descriptors = completions[0]["body"]["tools"].as_array().unwrap();
+    let client_descriptor = tool_descriptors
+        .iter()
+        .find(|tool| {
+            tool["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("c2a_client_"))
+        })
+        .expect("wire alias in upstream tools");
+    assert_eq!(
+        client_descriptor["input_schema"],
+        json!({
+            "type":"object",
+            "properties":{"value":{"type":"string"}},
+            "required":["value"],
+            "additionalProperties":false
+        })
+    );
+
+    let tool_results: Vec<_> = traces
+        .iter()
+        .filter(|trace| {
+            trace["method"] == "POST" && trace["uri"].as_str().unwrap().ends_with("/tool_result")
+        })
+        .collect();
+    assert_eq!(
+        tool_results.len(),
+        1,
+        "one client result must be posted once"
+    );
+    let result = tool_results[0];
+    assert_eq!(result["body"]["type"], "tool_result");
+    assert_eq!(
+        result["body"]["tool_use_id"],
+        "toolu_upstream_client_fixture"
+    );
+    assert_eq!(result["body"]["is_error"], false);
+    assert_eq!(
+        result["body"]["content"],
+        json!([{"type":"text","text":result_text}]),
+        "the live completion receives only the caller's result content"
+    );
+    assert_eq!(
+        result["body"]["content"][0],
+        json!({"type":"text","text":result_text})
+    );
+    let completion_path = completions[0]["uri"]
+        .as_str()
+        .unwrap()
+        .strip_suffix("/completion")
+        .unwrap();
+    assert_eq!(result["uri"], format!("{completion_path}/tool_result"));
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 1);
+    assert!(f.upstream.client_tool_waiters.lock().await.is_empty());
+    let session = f.engine.store.read().await.sessions[&handle].clone();
+    assert!(!session.uncertain);
+}
+
+#[tokio::test]
+async fn client_tool_result_followed_by_user_text_rebuilds_and_preserves_both_blocks() {
+    let f = fixture(1).await;
+    f.upstream.replies.lock().await.extend([
+        Reply::ClientTool {
+            input: json!({"value":"user text after result"}),
+            final_text: "must not resume after a following user instruction".to_owned(),
+        },
+        Reply::Text("answered the follow-up".to_owned()),
+    ]);
+    let mut request = synthetic_client_tool_request(json!({"type":"auto"}), false);
+    let (status, headers, first) = call(
+        &f.engine,
+        "/v1/messages",
+        request.clone(),
+        Some("client-tool-result-following-user-text"),
+    )
+    .await;
+    assert_eq!(status, 200, "{first}");
+    let handle = headers["x-c2a-session-id"].to_str().unwrap().to_owned();
+    let tool_call = first["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|block| block["type"] == "tool_use")
+        .expect("first generation should request a client tool")
+        .clone();
+
+    let result_text = "original client result";
+    let follow_up = "Now explain the result in one sentence.";
+    request["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":[tool_call.clone()]}),
+        json!({"role":"user","content":[
+            {"type":"tool_result","tool_use_id":tool_call["id"],"content":result_text},
+            {"type":"text","text":follow_up}
+        ]}),
+    ]);
+    let (status, resumed_headers, response) =
+        call(&f.engine, "/v1/messages", request, Some(&handle)).await;
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(resumed_headers["x-c2a-session-id"], handle);
+    assert_eq!(response["content"][0]["text"], "answered the follow-up");
+
+    let traces = f.upstream.traces.lock().await;
+    let completions = completion_requests(&traces);
+    assert_eq!(completions.len(), 2);
+    assert_fresh_stop_before_rebuild(&traces);
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 2);
+    let prompt = completions[1]["body"]["prompt"].as_str().unwrap();
+    let envelope = prompt
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value.get("history").is_some())
+        .expect("fresh completion should receive the full history");
+    let history = envelope["history"].as_array().unwrap();
+    let last = history.last().unwrap();
+    assert_eq!(last["role"], "user");
+    assert_eq!(last["content"].as_array().unwrap().len(), 2);
+    assert_eq!(last["content"][0]["type"], "tool_result");
+    assert_eq!(last["content"][0]["content"][0]["text"], result_text);
+    assert_eq!(last["content"][1]["type"], "text");
+    assert_eq!(last["content"][1]["text"], follow_up);
+    assert_eq!(
+        traces
+            .iter()
+            .filter(|trace| trace["method"] == "POST"
+                && trace["uri"].as_str().unwrap().ends_with("/tool_result"))
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn client_tool_system_instruction_added_after_result_rebuilds_without_sidechannel_post() {
+    let f = fixture(1).await;
+    f.upstream.replies.lock().await.extend([
+        Reply::ClientTool {
+            input: json!({"value":"system instruction after result"}),
+            final_text: "must not resume after an instruction change".to_owned(),
+        },
+        Reply::Text("followed the new instruction".to_owned()),
+    ]);
+    let mut request = synthetic_client_tool_request(json!({"type":"auto"}), false);
+    let (status, headers, first) = call(
+        &f.engine,
+        "/v1/messages",
+        request.clone(),
+        Some("client-tool-system-instruction-rebuild"),
+    )
+    .await;
+    assert_eq!(status, 200, "{first}");
+    let handle = headers["x-c2a-session-id"].to_str().unwrap().to_owned();
+    let tool_call = first["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|block| block["type"] == "tool_use")
+        .expect("first generation should request a client tool")
+        .clone();
+
+    let result_text = "original result remains separate";
+    let instruction = "Use the returned result and answer concisely.";
+    request["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":[tool_call.clone()]}),
+        json!({"role":"user","content":[{
+            "type":"tool_result","tool_use_id":tool_call["id"],"content":result_text
+        }]}),
+        json!({"role":"system","content":instruction}),
+    ]);
+    let (status, resumed_headers, response) =
+        call(&f.engine, "/v1/messages", request, Some(&handle)).await;
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(resumed_headers["x-c2a-session-id"], handle);
+    assert_eq!(
+        response["content"][0]["text"],
+        "followed the new instruction"
+    );
+
+    let traces = f.upstream.traces.lock().await;
+    let completions = completion_requests(&traces);
+    assert_eq!(completions.len(), 2);
+    assert_fresh_stop_before_rebuild(&traces);
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 2);
+    let prompt = completions[1]["body"]["prompt"].as_str().unwrap();
+    let envelope = prompt
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value.get("history").is_some())
+        .expect("fresh completion should receive the full history envelope");
+    assert_eq!(envelope["system"], instruction);
+    let history = envelope["history"].as_array().unwrap();
+    let result = &history.last().unwrap()["content"][0];
+    assert_eq!(result["type"], "tool_result");
+    assert_eq!(result["content"][0]["text"], result_text);
+    assert_eq!(
+        traces
+            .iter()
+            .filter(|trace| trace["method"] == "POST"
+                && trace["uri"].as_str().unwrap().ends_with("/tool_result"))
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn client_tool_preflight_500_or_429_allows_only_the_exact_fresh_retry() {
+    for preflight_status in [500, 429] {
+        let f = fixture(1).await;
+        let failed_reply = if preflight_status == 429 {
+            Reply::HttpRetry(429, "0".to_owned())
+        } else {
+            Reply::Http(500)
+        };
+        f.upstream.replies.lock().await.extend([
+            Reply::ClientTool {
+                input: json!({"value":"first and only client call"}),
+                final_text: "the original pending stream must be replaced".to_owned(),
+            },
+            failed_reply,
+            Reply::Text("the exact retry completed".to_owned()),
+        ]);
+        let mut request = synthetic_client_tool_request(json!({"type":"auto"}), false);
+        let (handle, tool_call) =
+            start_synthetic_client_tool(&f, request.clone(), "client-tool-fresh-preflight-retry")
+                .await;
+        append_client_tool_result(
+            &mut request,
+            &tool_call,
+            json!("original tool result"),
+            Some("Answer this follow-up after the tool result."),
+        );
+
+        let (status, _, failure) =
+            call(&f.engine, "/v1/messages", request.clone(), Some(&handle)).await;
+        assert_ne!(status, 200, "preflight {preflight_status}: {failure}");
+        let account_id = f.engine.store.read().await.sessions[&handle]
+            .account_id
+            .clone();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while f.engine.pool.busy(&account_id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed fresh preflight must release the account lease");
+        {
+            let traces = f.upstream.traces.lock().await;
+            assert_eq!(completion_requests(&traces).len(), 2);
+            assert_stop_before_replacement_completion(&traces, 1);
+            assert_eq!(f.upstream.created.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                traces
+                    .iter()
+                    .filter(|trace| trace["method"] == "POST"
+                        && trace["uri"].as_str().unwrap().ends_with("/tool_result"))
+                    .count(),
+                0
+            );
+        }
+        if preflight_status == 429 {
+            f.engine
+                .store
+                .mutate("", json!({}), |state| {
+                    for account in state.accounts.values_mut() {
+                        account.cooldown_until = 0;
+                        account.quota_until = 0;
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        reset_pacing(&f.engine).await;
+        let (status, headers, response) =
+            call(&f.engine, "/v1/messages", request, Some(&handle)).await;
+        assert_eq!(status, 200, "preflight {preflight_status}: {response}");
+        assert_eq!(headers["x-c2a-session-id"], handle);
+        assert_eq!(response["content"][0]["text"], "the exact retry completed");
+
+        let traces = f.upstream.traces.lock().await;
+        assert_eq!(completion_requests(&traces).len(), 3);
+        assert_eq!(f.upstream.created.load(Ordering::SeqCst), 3);
+        assert_stop_before_replacement_completion(&traces, 1);
+        assert!(traces.iter().all(|trace| {
+            !trace["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.ends_with("/tool_result"))
+        }));
+        assert_eq!(f.upstream.client_tool_waiters.lock().await.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn failed_stop_response_must_succeed_before_retry_can_start_fresh() {
+    let f = fixture(1).await;
+    f.upstream.replies.lock().await.extend([
+        Reply::ClientTool {
+            input: json!({"value":"keep the first tool call"}),
+            final_text: "the old completion remains open until explicitly stopped".to_owned(),
+        },
+        Reply::Text("retry after a successful stop".to_owned()),
+    ]);
+    let mut request = synthetic_client_tool_request(json!({"type":"auto"}), false);
+    let (handle, tool_call) =
+        start_synthetic_client_tool(&f, request.clone(), "client-tool-stop-failure-retry").await;
+    append_client_tool_result(
+        &mut request,
+        &tool_call,
+        json!("caller result"),
+        Some("Please summarize the caller result."),
+    );
+    f.upstream.stop_response_status.store(500, Ordering::SeqCst);
+
+    let (status, _, failure) =
+        call(&f.engine, "/v1/messages", request.clone(), Some(&handle)).await;
+    assert_eq!(status, 502, "{failure}");
+    let account_id = f.engine.store.read().await.sessions[&handle]
+        .account_id
+        .clone();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while f.engine.pool.busy(&account_id).await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a failed stop request must release its account lease");
+    {
+        let traces = f.upstream.traces.lock().await;
+        assert_eq!(completion_requests(&traces).len(), 1);
+        assert_eq!(f.upstream.created.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            traces
+                .iter()
+                .filter(|trace| trace["method"] == "POST"
+                    && trace["uri"].as_str().unwrap().ends_with("/stop_response"))
+                .count(),
+            1
+        );
+        assert!(traces.iter().all(|trace| {
+            !trace["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.ends_with("/tool_result"))
+        }));
+    }
+
+    f.upstream.stop_response_status.store(0, Ordering::SeqCst);
+    reset_pacing(&f.engine).await;
+    let (status, headers, response) = call(&f.engine, "/v1/messages", request, Some(&handle)).await;
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(headers["x-c2a-session-id"], handle);
+    assert_eq!(
+        response["content"][0]["text"],
+        "retry after a successful stop"
+    );
+    let traces = f.upstream.traces.lock().await;
+    assert_eq!(completion_requests(&traces).len(), 2);
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 2);
+    assert_stop_before_replacement_completion_with_count(&traces, 1, 2);
+    assert!(traces.iter().all(|trace| {
+        !trace["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.ends_with("/tool_result"))
+    }));
+}
+
+#[tokio::test]
+async fn tampered_fresh_retry_result_is_rejected_without_consuming_the_receipt() {
+    let f = fixture(1).await;
+    f.upstream.replies.lock().await.extend([
+        Reply::ClientTool {
+            input: json!({"value":"preserve the result receipt"}),
+            final_text: "the original pending stream is stopped".to_owned(),
+        },
+        Reply::Http(500),
+        Reply::Text("the original result was retried".to_owned()),
+    ]);
+    let mut request = synthetic_client_tool_request(json!({"type":"auto"}), false);
+    let (handle, tool_call) =
+        start_synthetic_client_tool(&f, request.clone(), "client-tool-tampered-fresh-retry").await;
+    append_client_tool_result(
+        &mut request,
+        &tool_call,
+        json!("immutable tool result"),
+        Some("Continue with the result."),
+    );
+    let (status, _, failure) =
+        call(&f.engine, "/v1/messages", request.clone(), Some(&handle)).await;
+    assert_ne!(status, 200, "{failure}");
+    reset_pacing(&f.engine).await;
+    let traces_before_tamper = f.upstream.traces.lock().await.len();
+
+    let mut tampered = request.clone();
+    tampered["messages"][2]["content"][0]["content"] = json!("modified tool result");
+    let (status, _, rejected) = call(&f.engine, "/v1/messages", tampered, Some(&handle)).await;
+    assert_eq!(status, 409, "{rejected}");
+    assert_eq!(f.upstream.traces.lock().await.len(), traces_before_tamper);
+
+    let (status, headers, response) = call(&f.engine, "/v1/messages", request, Some(&handle)).await;
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(headers["x-c2a-session-id"], handle);
+    assert_eq!(
+        response["content"][0]["text"],
+        "the original result was retried"
+    );
+    let traces = f.upstream.traces.lock().await;
+    assert_eq!(completion_requests(&traces).len(), 3);
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 3);
+    assert_stop_before_replacement_completion(&traces, 1);
+    assert!(traces.iter().all(|trace| {
+        !trace["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.ends_with("/tool_result"))
+    }));
+}
+
+#[tokio::test]
+async fn fresh_retry_receipt_does_not_survive_restart_and_retires_old_target() {
+    let f = fixture(1).await;
+    f.upstream.replies.lock().await.extend([
+        Reply::ClientTool {
+            input: json!({"value":"result can only retry in this process"}),
+            final_text: "the old web stream must be stopped".to_owned(),
+        },
+        Reply::Http(500),
+    ]);
+    let mut request = synthetic_client_tool_request(json!({"type":"auto"}), false);
+    let (handle, tool_call) =
+        start_synthetic_client_tool(&f, request.clone(), "client-tool-fresh-retry-restart").await;
+    append_client_tool_result(
+        &mut request,
+        &tool_call,
+        json!("preserve this result across only in-process retries"),
+        Some("Continue from this result."),
+    );
+    let original_session = f.engine.store.read().await.sessions[&handle].clone();
+    let old_target = original_session.conversation_id.clone();
+    let (status, _, failure) =
+        call(&f.engine, "/v1/messages", request.clone(), Some(&handle)).await;
+    assert_ne!(status, 200, "{failure}");
+    {
+        let state = f.engine.store.read().await;
+        let waiting = &state.sessions[&handle];
+        assert!(waiting.uncertain);
+        assert!(!waiting.active);
+        assert!(waiting.expires_at <= store::now() + 600);
+    }
+
+    f.engine.store.flush_status().await.unwrap();
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(&f.engine.store.db)
+        .await
+        .unwrap();
+    let restart_dir = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        f.engine.config.data_dir.join("control.sqlite3"),
+        restart_dir.path().join("control.sqlite3"),
+    )
+    .unwrap();
+    let mut restarted_config = f.engine.config.clone();
+    restarted_config.data_dir = restart_dir.path().to_owned();
+    let restarted = Engine::open(restarted_config).await.unwrap();
+    let restarted_state = restarted.store.read().await;
+    assert!(!restarted_state.sessions.contains_key(&handle));
+    assert!(restarted_state.pending.iter().any(|job| {
+        job.account_id == original_session.account_id && job.conversation_id == old_target
+    }));
+    drop(restarted_state);
+
+    let traces_before_lost_retry = f.upstream.traces.lock().await.len();
+    let (status, _, lost) = call(&restarted, "/v1/messages", request, Some(&handle)).await;
+    assert_eq!(
+        status, 409,
+        "a process-local receipt must not survive restart: {lost}"
+    );
+    assert_eq!(
+        f.upstream.traces.lock().await.len(),
+        traces_before_lost_retry
+    );
+    assert_eq!(
+        completion_requests(&f.upstream.traces.lock().await).len(),
+        2
+    );
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn expired_fresh_retry_session_is_retired_and_queued_without_generation() {
+    let f = fixture(1).await;
+    f.upstream.replies.lock().await.extend([
+        Reply::ClientTool {
+            input: json!({"value":"expire the retry session"}),
+            final_text: "the original response is stopped".to_owned(),
+        },
+        Reply::Http(500),
+    ]);
+    let mut request = synthetic_client_tool_request(json!({"type":"auto"}), false);
+    let (handle, tool_call) =
+        start_synthetic_client_tool(&f, request.clone(), "client-tool-expired-fresh-retry").await;
+    append_client_tool_result(
+        &mut request,
+        &tool_call,
+        json!("the result must not trigger another generation"),
+        Some("Continue with this result."),
+    );
+    let original_session = f.engine.store.read().await.sessions[&handle].clone();
+    let old_target = original_session.conversation_id.clone();
+    let (status, _, failure) =
+        call(&f.engine, "/v1/messages", request.clone(), Some(&handle)).await;
+    assert_ne!(
+        status, 200,
+        "the first fresh generation should fail: {failure}"
+    );
+
+    f.engine
+        .store
+        .mutate("", json!({}), |state| {
+            state
+                .sessions
+                .get_mut(&handle)
+                .expect("the session exists before its test expiry")
+                .expires_at = store::now() - 1;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    reset_pacing(&f.engine).await;
+    let (status, _, expired) = call(&f.engine, "/v1/messages", request, Some(&handle)).await;
+    assert_eq!(
+        status, 409,
+        "expired continuation must fail closed: {expired}"
+    );
+
+    let state = f.engine.store.read().await;
+    assert!(!state.sessions.contains_key(&handle));
+    assert!(state.pending.iter().any(|job| {
+        job.account_id == original_session.account_id && job.conversation_id == old_target
+    }));
+    drop(state);
+    let traces = f.upstream.traces.lock().await;
+    assert_eq!(completion_requests(&traces).len(), 2);
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn fresh_retry_receipt_is_removed_after_real_upstream_content() {
+    let f = fixture(1).await;
+    let raw = [
+        event(json!({"type":"message_start"})),
+        event(json!({
+            "type":"content_block_start","index":0,
+            "content_block":{"type":"text","text":""}
+        })),
+        event(json!({
+            "type":"content_block_delta","index":0,
+            "delta":{"type":"text_delta","text":"partial generated answer"}
+        })),
+        event(json!({"type":"content_block_stop","index":0})),
+        event(json!({
+            "type":"error",
+            "error":{"error_type":"overloaded_error","message":"fixture failure after content"}
+        })),
+    ]
+    .concat();
+    f.upstream.replies.lock().await.extend([
+        Reply::ClientTool {
+            input: json!({"value":"the client tool was already called"}),
+            final_text: "the old stream is stopped first".to_owned(),
+        },
+        Reply::Raw(raw),
+    ]);
+    let mut request = synthetic_client_tool_request(json!({"type":"auto"}), false);
+    let (handle, tool_call) =
+        start_synthetic_client_tool(&f, request.clone(), "client-tool-no-retry-after-content")
+            .await;
+    let original_session = f.engine.store.read().await.sessions[&handle].clone();
+    let old_target = original_session.conversation_id.clone();
+    append_client_tool_result(
+        &mut request,
+        &tool_call,
+        json!("real tool result"),
+        Some("Append this real user follow-up."),
+    );
+    let (status, _, failure) =
+        call(&f.engine, "/v1/messages", request.clone(), Some(&handle)).await;
+    assert_ne!(status, 200, "{failure}");
+    {
+        let state = f.engine.store.read().await;
+        assert!(
+            !state.sessions.contains_key(&handle),
+            "failure after generated content must retire the uncertain session"
+        );
+        assert!(
+            state.pending.iter().any(|job| {
+                job.account_id == original_session.account_id && job.conversation_id == old_target
+            }),
+            "retiring the uncertain session must queue the stopped old target for cleanup"
+        );
+    }
+    let traces_before_retry = f.upstream.traces.lock().await.len();
+    let (status, _, rejected) = call(&f.engine, "/v1/messages", request, Some(&handle)).await;
+    assert_eq!(status, 409, "{rejected}");
+    assert_eq!(f.upstream.traces.lock().await.len(), traces_before_retry);
+    let traces = f.upstream.traces.lock().await;
+    assert_eq!(completion_requests(&traces).len(), 2);
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 2);
+    assert_stop_before_replacement_completion(&traces, 1);
+    assert!(traces.iter().all(|trace| {
+        !trace["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.ends_with("/tool_result"))
+    }));
+}
+
+#[tokio::test]
+async fn client_tool_choice_change_to_any_or_named_rebuilds_with_new_policy() {
+    for choice in [
+        json!({"type":"any"}),
+        json!({"type":"tool","name":"synthetic_echo"}),
+    ] {
+        let f = fixture(1).await;
+        f.upstream.replies.lock().await.extend([
+            Reply::ClientTool {
+                input: json!({"value":"first call"}),
+                final_text: "first pending stream must not be resumed".to_owned(),
+            },
+            Reply::ClientTool {
+                input: json!({"value":"second call"}),
+                final_text: "second pending stream is unused".to_owned(),
+            },
+        ]);
+        let mut request = synthetic_client_tool_request(json!({"type":"auto"}), false);
+        let (status, headers, first) = call(
+            &f.engine,
+            "/v1/messages",
+            request.clone(),
+            Some("client-tool-choice-change"),
+        )
+        .await;
+        assert_eq!(status, 200, "{first}");
+        let handle = headers["x-c2a-session-id"].to_str().unwrap().to_owned();
+        let first_tool = first["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|block| block["type"] == "tool_use")
+            .expect("first generation should request a client tool")
+            .clone();
+        request["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","content":[first_tool.clone()]}),
+            json!({"role":"user","content":[{
+                "type":"tool_result","tool_use_id":first_tool["id"],
+                "content":"first call completed by the caller"
+            }]}),
+        ]);
+        request["tool_choice"] = choice.clone();
+
+        let (status, resumed_headers, response) =
+            call(&f.engine, "/v1/messages", request, Some(&handle)).await;
+        assert_eq!(status, 200, "{response}");
+        assert_eq!(resumed_headers["x-c2a-session-id"], handle);
+        assert_eq!(response["stop_reason"], "tool_use");
+        assert!(
+            response["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|block| { block["type"] == "tool_use" && block["name"] == "synthetic_echo" })
+        );
+
+        let traces = f.upstream.traces.lock().await;
+        let completions = completion_requests(&traces);
+        assert_eq!(completions.len(), 2);
+        assert_fresh_stop_before_rebuild(&traces);
+        assert_eq!(f.upstream.created.load(Ordering::SeqCst), 2);
+        let prompt = completions[1]["body"]["prompt"].as_str().unwrap();
+        let envelope = prompt
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| value.get("history").is_some())
+            .expect("fresh completion should receive the full history envelope");
+        assert_eq!(envelope["tool_policy"]["type"], choice["type"]);
+        if choice["type"] == "tool" {
+            assert_eq!(envelope["tool_policy"]["name"], "synthetic_echo");
+        }
+        assert_eq!(
+            envelope["history"].as_array().unwrap().last().unwrap()["content"][0]["type"],
+            "tool_result"
+        );
+        assert!(
+            completions[1]["body"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("c2a_client_")))
+        );
+        assert_eq!(
+            traces
+                .iter()
+                .filter(|trace| trace["method"] == "POST"
+                    && trace["uri"].as_str().unwrap().ends_with("/tool_result"))
+                .count(),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn lost_client_tool_continuation_after_restart_fails_closed_and_shutdown_releases_account() {
+    let f = fixture(1).await;
+    f.upstream
+        .replies
+        .lock()
+        .await
+        .push_back(Reply::ClientTool {
+            input: json!({"value":"synthetic marker"}),
+            final_text: "unused after restart".to_owned(),
+        });
+    let mut request = base();
+    request["tools"] = json!([{
+        "name":"synthetic_echo",
+        "description":"Echo a synthetic value.",
+        "input_schema":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}
+    }]);
+    let (status, headers, first) = call(
+        &f.engine,
+        "/v1/messages",
+        request.clone(),
+        Some("client-tool-restart"),
+    )
+    .await;
+    assert_eq!(status, 200, "{first}");
+    assert_eq!(first["stop_reason"], "tool_use");
+    let handle = headers["x-c2a-session-id"].to_str().unwrap().to_owned();
+    let tool_call = first["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|block| block["type"] == "tool_use")
+        .unwrap()
+        .clone();
+    let original_session = f.engine.store.read().await.sessions[&handle].clone();
+    assert!(f.engine.pool.busy(&original_session.account_id).await);
+
+    request["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":[tool_call.clone()]}),
+        json!({"role":"user","content":[{
+            "type":"tool_result","tool_use_id":tool_call["id"],"content":"synthetic result"
+        }]}),
+    ]);
+    let restart_dir = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        f.engine.config.data_dir.join("control.sqlite3"),
+        restart_dir.path().join("control.sqlite3"),
+    )
+    .unwrap();
+    let mut restarted_config = f.engine.config.clone();
+    restarted_config.data_dir = restart_dir.path().to_owned();
+    let restarted = Engine::open(restarted_config).await.unwrap();
+    let traces_before = f.upstream.traces.lock().await.len();
+    let (status, _, lost) = call(&restarted, "/v1/messages", request, Some(&handle)).await;
+    assert_eq!(
+        status, 409,
+        "a restart-lost tool result must fail closed: {lost}"
+    );
+    assert_eq!(f.upstream.traces.lock().await.len(), traces_before);
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        completion_requests(&f.upstream.traces.lock().await).len(),
+        1
+    );
+
+    f.engine.shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let session_removed = !f.engine.store.read().await.sessions.contains_key(&handle);
+            let account_released = !f.engine.pool.busy(&original_session.account_id).await;
+            if session_removed && account_released {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown should discard the parked completion and release its account");
+}
+
+#[tokio::test]
+async fn default_native_output_uses_standard_blocks_and_preserves_continuation_for_json_and_sse() {
+    let mut final_texts = Vec::new();
+    for stream in [false, true] {
+        let f = fixture(1).await;
+        f.upstream
+            .replies
+            .lock()
+            .await
+            .push_back(Reply::Raw(native_search_events()));
+        let mut request = base();
+        request
+            .as_object_mut()
+            .unwrap()
+            .remove("claud2api_native_output");
+        request["stream"] = json!(stream);
+        let (status, headers, output) =
+            call(&f.engine, "/v1/messages", request.clone(), None).await;
+        assert_eq!(status, 200, "{output}");
+        let content = if stream {
+            let values = sse_values(output.as_str().unwrap());
+            assert!(!output.as_str().unwrap().contains("claud2api_native"));
+            let text = values
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|event| event.pointer("/delta/text").and_then(Value::as_str))
+                .collect::<String>();
+            json!([{"type":"text","text":text}])
+        } else {
+            assert!(
+                output["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|block| block["type"] == "text")
+            );
+            output["content"].clone()
+        };
+        let text = content
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<String>();
+        assert!(text.contains("web_search"));
+        assert!(text.contains("https://example.com/source"));
+        assert_eq!(text.matches("https://example.com/source").count(), 1);
+        assert!(text.contains("甲乙丙"));
+        final_texts.push(text);
+        let id = headers["x-c2a-session-id"].to_str().unwrap().to_owned();
+        let logs = logs_for_request(&f.engine, headers["x-request-id"].to_str().unwrap()).await;
+        let downstream = logs
+            .iter()
+            .find(|row| row["direction"] == "downstream")
+            .unwrap();
+        assert_eq!(
+            downstream["native_tools"],
+            json!([{"name":"web_search","status":"completed"}])
+        );
+        assert_eq!(downstream["native_tools_complete"], true);
+        assert!(
+            !downstream["native_tools"]
+                .to_string()
+                .contains("toolu-search-1")
+        );
+        request["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","content":content}),
+            json!({"role":"user","content":"Repeat the source without another search."}),
+        ]);
+        reset_pacing(&f.engine).await;
+        let (status, _, out) = call(&f.engine, "/v1/messages", request, Some(&id)).await;
+        assert_eq!(status, 200, "{out}");
+        assert_eq!(f.upstream.created.load(Ordering::SeqCst), 1);
+    }
+    assert_eq!(final_texts[0], final_texts[1]);
+}
+
+#[tokio::test]
+async fn truncated_native_stream_retains_calls_but_marks_the_audit_incomplete() {
+    let f = fixture(1).await;
+    let events = [
+        json!({"type":"message_start"}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"private-truncated-id","name":"web_search","input":{"query":"fixture"}}}),
+        json!({"type":"content_block_stop","index":0})
+    ].into_iter().map(event).collect::<String>();
+    f.upstream
+        .replies
+        .lock()
+        .await
+        .push_back(Reply::Raw(events));
+    let (status, headers, _) = call(&f.engine, "/v1/messages", base(), None).await;
+    assert_eq!(status, 502);
+    let logs = logs_for_request(&f.engine, headers["x-request-id"].to_str().unwrap()).await;
+    let downstream = logs
+        .iter()
+        .find(|row| row["direction"] == "downstream")
+        .unwrap();
+    assert_eq!(downstream["native_tools_complete"], false);
+    assert_eq!(
+        downstream["native_tools"],
+        json!([{"name":"web_search","status":"started"}])
+    );
+    assert!(!downstream.to_string().contains("private-truncated-id"));
+}
+
+#[tokio::test]
+async fn standard_native_errors_are_visible_in_both_json_and_streamed_output() {
+    let mut texts = Vec::new();
+    for stream in [false, true] {
+        let f = fixture(1).await;
+        let events = [
+            json!({"type":"message_start"}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"failed-native","name":"web_search","input":{"query":"fixture"}}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_result","tool_use_id":"failed-native","content":[{"type":"text","text":"Fixture search failed; no results returned."}],"is_error":true}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+            json!({"type":"message_stop"})
+        ].into_iter().map(event).collect::<String>();
+        f.upstream
+            .replies
+            .lock()
+            .await
+            .push_back(Reply::Raw(events));
+        let mut request = base();
+        request
+            .as_object_mut()
+            .unwrap()
+            .remove("claud2api_native_output");
+        request["stream"] = json!(stream);
+        let (status, headers, out) = call(&f.engine, "/v1/messages", request, None).await;
+        assert_eq!(status, 200, "{out}");
+        let text = if stream {
+            sse_values(out.as_str().unwrap())
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|value| value.pointer("/delta/text").and_then(Value::as_str))
+                .collect::<String>()
+        } else {
+            out["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .collect::<String>()
+        };
+        assert!(text.contains("web_search; is_error=true"));
+        assert!(text.contains("no results returned"));
+        assert!(!text.contains("unknown"));
+        let logs = logs_for_request(&f.engine, headers["x-request-id"].to_str().unwrap()).await;
+        assert_eq!(
+            logs.iter()
+                .find(|row| row["direction"] == "downstream")
+                .unwrap()["native_tools"],
+            json!([{"name":"web_search","status":"error"}])
+        );
+        texts.push(text);
+    }
+    assert_eq!(texts[0], texts[1]);
+}
+
+#[tokio::test]
+async fn tool_choice_none_removes_native_descriptors_before_upstream_generation() {
+    let f = fixture(1).await;
+    let mut request = base();
+    request["tool_choice"] = json!({"type":"none"});
+    let (status, headers, out) = call(&f.engine, "/v1/messages", request, None).await;
+    assert_eq!(status, 200, "{out}");
+    let traces = f.upstream.traces.lock().await;
+    let calls = completion_requests(&traces);
+    assert_eq!(calls[0]["body"]["tools"], json!([]));
+    assert!(
+        !calls[0]["body"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("\"native_tools\"")
+    );
+    drop(traces);
+    let logs = logs_for_request(&f.engine, headers["x-request-id"].to_str().unwrap()).await;
+    assert_eq!(
+        logs.iter()
+            .find(|row| row["direction"] == "downstream")
+            .unwrap()["native_tools"],
+        json!([])
+    );
 }
 
 #[tokio::test]
@@ -2745,6 +4709,76 @@ async fn continuation_sends_delta_reuses_parent_and_simulates_cache() {
     assert!(!prompt.contains("\"text\":\"hello\""));
 }
 #[tokio::test]
+async fn client_optional_default_replay_continues_but_real_tool_argument_edits_rebuild() {
+    let f = fixture(1).await;
+    let mut request = base();
+    request["tools"] = json!([{"name":"Edit","input_schema":{
+        "type":"object","properties":{
+            "file_path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},
+            "replace_all":{"type":"boolean","default":false}
+        },"required":["file_path","old_string","new_string"],"additionalProperties":false
+    }}]);
+    let (status, headers, first) = call(
+        &f.engine,
+        "/v1/messages",
+        request.clone(),
+        Some("default-replay"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let handle = headers["x-c2a-session-id"].to_str().unwrap().to_owned();
+    let nonce = f.engine.store.read().await.sessions[&handle].nonce.clone();
+    request["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":first["content"]}),
+        json!({"role":"user","content":"Edit the fixture."}),
+    ]);
+    f.upstream.replies.lock().await.push_back(Reply::Text(format!(
+        "<tool_call_{nonce}>{{\"name\":\"Edit\",\"input\":{{\"file_path\":\"fixture.txt\",\"old_string\":\"one\",\"new_string\":\"two\"}}}}</tool_call_{nonce}>"
+    )));
+    reset_pacing(&f.engine).await;
+    let (status, _, tool_response) =
+        call(&f.engine, "/v1/messages", request.clone(), Some(&handle)).await;
+    assert_eq!(status, 200, "{tool_response}");
+    assert_eq!(tool_response["content"][0]["type"], "tool_use");
+    assert!(
+        tool_response["content"][0]["input"]
+            .get("replace_all")
+            .is_none()
+    );
+    let tool_id = tool_response["content"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let before = f.engine.store.read().await.sessions[&handle].clone();
+    let mut replay = tool_response["content"].clone();
+    replay[0]["input"]["replace_all"] = json!(false);
+    request["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":replay}),
+        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":tool_id,"content":"fixture edited"}]})
+    ]);
+    reset_pacing(&f.engine).await;
+    let (status, _, result) = call(&f.engine, "/v1/messages", request.clone(), Some(&handle)).await;
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.engine.store.read().await.sessions[&handle].conversation_id,
+        before.conversation_id
+    );
+    request["messages"][3]["content"][0]["input"]["old_string"] = json!("actual history edit");
+    request["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":result["content"]}),
+        json!({"role":"user","content":"Continue."}),
+    ]);
+    reset_pacing(&f.engine).await;
+    let (status, _, result) = call(&f.engine, "/v1/messages", request, Some(&handle)).await;
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 2);
+    assert_ne!(
+        f.engine.store.read().await.sessions[&handle].conversation_id,
+        before.conversation_id
+    );
+}
+#[tokio::test]
 async fn claude_code_attribution_changes_reuse_conversation_but_real_context_changes_reset() {
     for stream in [false, true] {
         let f = fixture(1).await;
@@ -3875,9 +5909,11 @@ async fn saved_compaction_policy_survives_restart_until_explicit_control_update(
 }
 
 async fn compaction_input(f: &Fixture) -> (String, Value) {
-    let (_, headers, first) = call(&f.engine, "/v1/messages", base(), Some("compact")).await;
+    compaction_input_with(f, base()).await
+}
+async fn compaction_input_with(f: &Fixture, mut v: Value) -> (String, Value) {
+    let (_, headers, first) = call(&f.engine, "/v1/messages", v.clone(), Some("compact")).await;
     let id = headers["x-c2a-session-id"].to_str().unwrap().to_owned();
-    let mut v = base();
     let messages = v["messages"].as_array_mut().unwrap();
     messages.push(json!({"role":"assistant","content":first["content"]}));
     for _ in 0..8 {
@@ -3905,6 +5941,46 @@ async fn compaction_input(f: &Fixture) -> (String, Value) {
         .unwrap();
     reset_pacing(&f.engine).await;
     (id, v)
+}
+#[tokio::test]
+async fn compaction_uploads_covered_images_to_summary_without_readding_them_to_recent_turns() {
+    let f = fixture(1).await;
+    let (id, v) = compaction_input_with(&f, media_request()).await;
+    f.upstream.replies.lock().await.extend([
+        Reply::Summary(r#"{"goal":"continue","constraints":[],"completed":[],"facts":["image contents preserved"],"open":[],"next":["continue"]}"#.to_owned()),
+        Reply::Text("continued".to_owned()),
+    ]);
+    let (status, _, out) = call(&f.engine, "/v1/messages", v, Some(&id)).await;
+    assert_eq!(status, 200, "{out}");
+    assert!(
+        f.engine.store.read().await.sessions[&id]
+            .checkpoint
+            .is_some()
+    );
+    assert_eq!(f.upstream.uploaded.lock().await.len(), 2);
+    let traces = f.upstream.traces.lock().await;
+    let calls = completion_requests(&traces);
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0]["body"]["files"].as_array().unwrap().len(), 1);
+    assert_eq!(calls[1]["body"]["files"].as_array().unwrap().len(), 1);
+    assert!(
+        calls[1]["body"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("Read the corresponding attached image or document")
+    );
+    assert_eq!(calls[2]["body"]["files"], json!([]));
+    assert!(
+        calls[2]["body"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("image contents preserved")
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|call| !call["body"]["prompt"].as_str().unwrap().contains(MEDIA_PNG))
+    );
 }
 #[tokio::test]
 async fn compaction_creates_checkpoint_and_rotates_after_success() {
@@ -5559,6 +7635,15 @@ async fn admin_upstream_catalog_is_explicit_native_durable_and_does_not_replace_
 #[tokio::test]
 async fn admin_catalog_uses_account_guard_and_retains_last_observation_on_access_failure() {
     let f = fixture(1).await;
+    // Keep the rate-limit assertion independent of a wall-clock second boundary.
+    f.engine
+        .store
+        .mutate("", json!({}), |state| {
+            state.settings.account_min_interval_seconds = 300;
+            Ok(())
+        })
+        .await
+        .unwrap();
     assert_eq!(
         admin(
             &f.engine,

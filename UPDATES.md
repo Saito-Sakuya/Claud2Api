@@ -5,8 +5,8 @@
 ## Update
 
 The app checks at startup and every five minutes. Patches within the current
-release line install automatically, such as `alpha.6 → alpha.6.1`. Feature versions
-such as `alpha.7` still need confirmation. You can disable automatic patches in
+release line install automatically, such as `alpha.7 → alpha.7.1`. Moving from
+`alpha.6.1` to `alpha.7` is a feature update requiring confirmation. You can disable automatic patches in
 **版本管理**.
 
 1. The version button glows amber for an available update. Click **版本管理**.
@@ -28,6 +28,7 @@ enable them again when ready.
 
 Save open edits and any newly created token. Keep the original data directory and
 key, and leave enough disk space for downloads and backups.
+Finish any pending tool-result round before upgrading; the old waiting call cannot resume afterward.
 
 Failed downloads or an unreachable GitHub leave the service running. If the new
 version fails to start, the app tries to restore the original version automatically.

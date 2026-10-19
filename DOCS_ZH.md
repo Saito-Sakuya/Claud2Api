@@ -2,7 +2,7 @@
 
 中文 · [English](DOCS.md)
 
-本文档组对应 **v0.1.0-alpha.6.1**。每份维护中的项目指南均有完整中英文对应版本。
+当前源码版本为 **v0.1.0-alpha.7**；变更见[更新记录](CHANGELOG.md)，发行状态以 GitHub Release 为准，工具与回归结果见[综测结果](TEST_SUMMARY.md)。每份维护中的项目指南均有完整中英文对应版本。
 原有默认文件名保持有效，可从下表或文档顶部切换语言。
 
 ## 阅读顺序
@@ -16,12 +16,13 @@
 
 | 主题 | 中文 | English | 主要内容 |
 |---|---|---|---|
-| 发行文件 | [发行文件说明](RELEASES_ZH.md) | [Release files](RELEASES.md) | alpha4–alpha6.1、Docker 镜像及下载文件用途 |
+| 发行文件 | [发行文件说明](RELEASES_ZH.md) | [Release files](RELEASES.md) | alpha4–alpha7、Docker 镜像及下载文件用途 |
 | 在线更新 | [版本管理](UPDATES_ZH.md) | [Version manager](UPDATES.md) | 检查新版、一键更新与回退 |
 | 项目入口 | [README](README.md) | [README](README_EN.md) | 安装、控制台使用、API 入口及免责声明 |
 | 开发者文档 | [开发者文档](DEVELOPMENT_ZH.md) | [Developer guide](DEVELOPMENT.md) | 架构、资源与状态归属、扩展、测试及发行 |
 | 安装 | [安装与运行](DEPLOY.md) | [Installation](DEPLOY_EN.md) | 原生／Compose、完整环境变量及备份 |
 | 公开 API | [API 文档](API_ZH.md) | [API contract](API.md) | 认证、模型、Messages／工具／SSE 及限制 |
+| 综测结果 | [简要综测表](TEST_SUMMARY.md) | [Test summary (Chinese)](TEST_SUMMARY.md) | 工具验收、Token 用量及回归结果 |
 | 控制接口 | [控制台接口](CONTROL_API.md) | [Control API](CONTROL_API_EN.md) | 账号、模型、令牌、设置、日志、统计及 Bot 读取 |
 | 桥接模型 ID | [桥接模型 ID](BRIDGE_COMPATIBILITY_ZH.md) | [Bridge model IDs](BRIDGE_COMPATIBILITY.md) | 原生名、c2a- 及配置模型名 |
 | 参数兼容 | [参数兼容](SUB2API_COMPATIBILITY_ZH.md) | [Compatibility controls](SUB2API_COMPATIBILITY.md) | 接受后丢弃的可选字段与保留的语义数据 |

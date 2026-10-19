@@ -184,6 +184,8 @@ GET /control/v1/logs?level=all&account_id=<账号ID>&limit=100&before=<游标>
 保留最多 10000 条、最长 7 天；异常退出后未完成记录标为中断。
 流式 HTTP 200 仅表示响应头已返回，终态错误仍会归入错误分类。
 日志不保存聊天正文、内部摘要、Cookie 或代理密码。
+最终下游记录的 `native_tools` 仅含允许的工具名称与 `started`／`completed`／`error` 状态；不含工具 ID、参数、结果正文或 URL。
+`native_tools_complete: true` 表示已完整解码，此时 `[]` 确认本轮没有原生调用；`false` 表示列表可能不完整或已截断（最多 128 次调用）。旧记录或未知情况的两个字段均为 `null`。
 
 生成记录还包含 `usage`，旧日志及非生成操作为 `null`，不会回填或当作零：
 

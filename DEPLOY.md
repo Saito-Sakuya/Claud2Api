@@ -20,7 +20,7 @@ Compose 面向 Linux，使用 host 网络并将 API / 控制台绑定到回环�
 公网 API 仅反代 `/health`、`/v1/*` 到 `127.0.0.1:18081`。控制台端口只用于 SSH 隧道。
 反向代理若运行在其他容器，请按主机网络拓扑设置地址，勿把代理容器自身回环地址作为服务地址。
 
-默认拉取已发布的 Linux AMD64 镜像，无需在服务器编译。设置 `CLAUD2API_IMAGE` 可固定其他发行版本；例如 `ghcr.io/saito-sakuya/claud2api:0.1.0-alpha.4`。需要从源码构建时改用 `docker compose --env-file /srv/claud2api-private/settings.env up -d --build`。
+默认拉取与源码版本对应的 Linux AMD64 镜像，须等该版本发行后可用。发布前可设置 `CLAUD2API_IMAGE=ghcr.io/saito-sakuya/claud2api:0.1.0-alpha.6.1` 使用已有发行版。需要从源码构建时改用 `docker compose --env-file /srv/claud2api-private/settings.env up -d --build`。
 
 发行文件与校验方法见[发行说明](RELEASES_ZH.md)。
 

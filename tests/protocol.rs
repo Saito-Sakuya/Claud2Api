@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use claud2api::{
     config::Settings,
     engine::{compaction_cut, normalize_summary},
@@ -6,6 +7,141 @@ use claud2api::{
     transport::SseDecoder,
 };
 use serde_json::{Value, json};
+
+const IMAGE_DATA: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+fn image_block() -> Value {
+    json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":IMAGE_DATA}})
+}
+
+#[test]
+fn native_output_mode_is_explicit_validated_and_part_of_context() {
+    let raw = request();
+    let mut standard = protocol::parse(&raw).unwrap();
+    assert!(!standard.native_extensions);
+    standard.native_tools = vec!["web_search".to_owned()];
+    let mut extensions = raw.clone();
+    extensions["claud2api_native_output"] = json!("extensions");
+    let mut parsed = protocol::parse(&extensions).unwrap();
+    parsed.native_tools = standard.native_tools.clone();
+    assert!(parsed.native_extensions);
+    assert_ne!(standard.context("k"), parsed.context("k"));
+    for invalid in [Value::Null, json!(true), json!("guessed")] {
+        extensions["claud2api_native_output"] = invalid;
+        assert!(protocol::parse(&extensions).is_err());
+    }
+    assert!(
+        native_tools::resolve(
+            &json!({"tool_choice":{"type":"none"}}),
+            &Settings::default()
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
+#[test]
+fn image_bytes_are_separate_from_prompt_and_part_of_history_identity() {
+    let mut raw = request();
+    raw["messages"][0]["content"] =
+        json!([image_block(), {"type":"text","text":"Describe the image."}]);
+    let parsed = protocol::parse(&raw).unwrap();
+    let uploads = parsed.uploads(&parsed.turns).unwrap();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(
+        uploads[0].data.as_ref(),
+        STANDARD.decode(IMAGE_DATA).unwrap()
+    );
+    let prompt = parsed.prompt("test");
+    assert!(prompt.contains(&uploads[0].reference.filename));
+    assert!(prompt.contains("attachment_transport"));
+    assert!(!prompt.contains(IMAGE_DATA));
+
+    let mut changed_bytes = STANDARD.decode(IMAGE_DATA).unwrap();
+    changed_bytes.extend_from_slice(b"different image bytes");
+    raw["messages"][0]["content"][0]["source"]["data"] = json!(STANDARD.encode(changed_bytes));
+    let changed = protocol::parse(&raw).unwrap();
+    assert_ne!(parsed.hashes("test-key"), changed.hashes("test-key"));
+    assert_eq!(parsed.context("test-key"), changed.context("test-key"));
+}
+
+#[test]
+fn documents_preserve_title_context_and_payload_without_inline_binary() {
+    let mut raw = request();
+    raw["messages"][0]["content"] = json!([{
+        "type":"document","title":"notes.txt","context":"Reference material",
+        "source":{"type":"text","media_type":"text/plain","data":"PRIVATE_DOCUMENT_BODY_4821"}
+    }]);
+    let parsed = protocol::parse(&raw).unwrap();
+    let uploads = parsed.uploads(&parsed.turns).unwrap();
+    assert_eq!(uploads.len(), 1);
+    assert!(uploads[0].reference.filename.starts_with("notes"));
+    assert!(uploads[0].reference.filename.ends_with(".txt"));
+    assert_eq!(
+        uploads[0].reference.context.as_deref(),
+        Some("Reference material")
+    );
+    assert_eq!(uploads[0].data.as_ref(), b"PRIVATE_DOCUMENT_BODY_4821");
+    assert!(!parsed.prompt("test").contains("PRIVATE_DOCUMENT_BODY_4821"));
+}
+
+#[test]
+fn client_tool_results_can_contain_real_image_attachments() {
+    let mut raw = request();
+    raw["tools"] = json!([{"name":"Read","input_schema":{"type":"object"}}]);
+    raw["messages"] = json!([
+        {"role":"user","content":"Read the image."},
+        {"role":"assistant","content":[{"type":"tool_use","id":"read-1","name":"Read","input":{}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"read-1","content":[image_block(),{"type":"text","text":"Page 1"}]}]}
+    ]);
+    let parsed = protocol::parse(&raw).unwrap();
+    assert_eq!(parsed.uploads(&parsed.turns).unwrap().len(), 1);
+    assert_eq!(parsed.uploads(&parsed.turns[2..]).unwrap().len(), 1);
+    assert!(parsed.uploads(&parsed.turns[..2]).unwrap().is_empty());
+    assert!(!parsed.prompt("test").contains(IMAGE_DATA));
+}
+
+#[test]
+fn distinct_attachment_names_are_bounded_during_parsing() {
+    let mut raw = request();
+    raw["messages"][0]["content"] = json!(
+        (0..21)
+            .map(|index| json!({
+                "type":"document","title":format!("file-{index}.txt"),
+                "source":{"type":"text","media_type":"text/plain","data":"identical bytes"}
+            }))
+            .collect::<Vec<_>>()
+    );
+    let fault = protocol::parse(&raw).unwrap_err();
+    assert_eq!(fault.status, 400);
+    assert!(fault.message.contains("too many"));
+}
+#[test]
+fn differently_named_identical_attachments_cannot_bypass_total_upload_limit() {
+    let mut raw = request();
+    let data = "x".repeat(2 * 1024 * 1024);
+    raw["messages"][0]["content"] = json!(
+        (0..10)
+            .map(|index| json!({
+                "type":"document","title":format!("file-{index}.txt"),
+                "source":{"type":"text","media_type":"text/plain","data":data}
+            }))
+            .collect::<Vec<_>>()
+    );
+    let parsed = protocol::parse(&raw).unwrap();
+    assert_eq!(parsed.uploads(&parsed.turns).unwrap().len(), 10);
+    raw["messages"][0]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "type":"document","title":"eleventh.txt",
+            "source":{"type":"text","media_type":"text/plain","data":data}
+        }));
+    let fault = protocol::parse(&raw).unwrap_err();
+    assert_eq!(fault.status, 400);
+    assert!(fault.message.contains("total size limit"));
+}
 #[test]
 fn message_envelope_preserves_roles_tool_contract_and_historical_summary() {
     let mut raw = tool_request();
@@ -35,6 +171,133 @@ fn message_envelope_preserves_roles_tool_contract_and_historical_summary() {
 }
 fn request() -> Value {
     json!({"model":"claude-haiku-5-5","max_tokens":100,"messages":[{"role":"user","content":"hello"}]})
+}
+fn default_argument_history() -> Value {
+    json!({
+        "model":"test","max_tokens":100,
+        "tools":[{"name":"Edit","input_schema":{
+            "type":"object","properties":{
+                "file_path":{"type":"string"},
+                "replace_all":{"type":"boolean","default":false}
+            },"required":["file_path"],"additionalProperties":false
+        }}],
+        "messages":[
+            {"role":"user","content":"Edit the fixture."},
+            {"role":"assistant","content":[{"type":"tool_use","id":"edit-default","name":"Edit","input":{"file_path":"fixture.txt"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"edit-default","content":"done"}]}
+        ]
+    })
+}
+#[test]
+fn declared_optional_defaults_are_equivalent_only_in_history_fingerprints() {
+    for (value, kind) in [
+        (json!(false), "boolean"),
+        (json!(0), "integer"),
+        (json!("local"), "string"),
+        (Value::Null, "null"),
+    ] {
+        let mut raw = default_argument_history();
+        raw["tools"][0]["input_schema"]["properties"]["replace_all"] =
+            json!({"type":kind,"default":value});
+        let absent = protocol::parse(&raw).unwrap();
+        let original = protocol::go_json(&absent.turns);
+        raw["messages"][1]["content"][0]["input"]["replace_all"] = value;
+        let explicit = protocol::parse(&raw).unwrap();
+        assert_eq!(absent.context("key"), explicit.context("key"));
+        assert_eq!(absent.hashes("key"), explicit.hashes("key"));
+        assert_eq!(protocol::go_json(&absent.turns), original);
+        assert_ne!(
+            protocol::go_json(&absent.turns),
+            protocol::go_json(&explicit.turns)
+        );
+        let mut decoder = ToolDecoder::new(&absent, "default");
+        let blocks = decoder.feed("<tool_call_default>{\"name\":\"Edit\",\"input\":{\"file_path\":\"fixture.txt\"}}</tool_call_default>").unwrap();
+        let Block::Tool { input, .. } = &blocks[0] else {
+            panic!("client tool call expected")
+        };
+        assert!(
+            input.get("replace_all").is_none(),
+            "the transport must not inject arguments"
+        );
+    }
+}
+#[test]
+fn history_default_equivalence_preserves_required_conditional_and_real_argument_changes() {
+    for case in [
+        "non-default",
+        "argument",
+        "id",
+        "no-default",
+        "required",
+        "conditional",
+        "property-count",
+        "invalid-default",
+        "nested-default",
+        "object-default",
+        "array-default",
+    ] {
+        let mut raw = default_argument_history();
+        match case {
+            "no-default" => {
+                raw["tools"][0]["input_schema"]["properties"]["replace_all"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("default");
+            }
+            "required" => {
+                raw["tools"][0]["input_schema"]["required"] = json!(["file_path", "replace_all"])
+            }
+            "conditional" => raw["tools"][0]["input_schema"]["allOf"] = json!([{}]),
+            "property-count" => raw["tools"][0]["input_schema"]["minProperties"] = json!(1),
+            "invalid-default" => {
+                raw["tools"][0]["input_schema"]["properties"]["replace_all"]["type"] =
+                    json!("string")
+            }
+            "nested-default" => {
+                raw["tools"][0]["input_schema"]["properties"]["replace_all"] = json!({"type":"object","properties":{"nested":{"type":"boolean","default":false}}});
+                raw["messages"][1]["content"][0]["input"]["replace_all"] = json!({});
+            }
+            "object-default" => {
+                raw["tools"][0]["input_schema"]["properties"]["replace_all"] =
+                    json!({"type":"object","default":{}})
+            }
+            "array-default" => {
+                raw["tools"][0]["input_schema"]["properties"]["replace_all"] =
+                    json!({"type":"array","default":[]})
+            }
+            _ => {}
+        }
+        let before = protocol::parse(&raw).unwrap();
+        match case {
+            "non-default" => raw["messages"][1]["content"][0]["input"]["replace_all"] = json!(true),
+            "argument" => {
+                raw["messages"][1]["content"][0]["input"]["file_path"] = json!("different.txt")
+            }
+            "id" => {
+                raw["messages"][1]["content"][0]["id"] = json!("different-id");
+                raw["messages"][2]["content"][0]["tool_use_id"] = json!("different-id");
+            }
+            "nested-default" => {
+                raw["messages"][1]["content"][0]["input"]["replace_all"]["nested"] = json!(false)
+            }
+            "object-default" => {
+                raw["messages"][1]["content"][0]["input"]["replace_all"] = json!({})
+            }
+            "array-default" => raw["messages"][1]["content"][0]["input"]["replace_all"] = json!([]),
+            _ => raw["messages"][1]["content"][0]["input"]["replace_all"] = json!(false),
+        }
+        let after = protocol::parse(&raw).unwrap();
+        assert_eq!(before.context("key"), after.context("key"));
+        assert_ne!(before.hashes("key"), after.hashes("key"), "case={case}");
+    }
+    let mut raw = default_argument_history();
+    raw["tools"][0] = json!({"name":"Bash","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}});
+    raw["messages"][1]["content"][0]["name"] = json!("Bash");
+    raw["messages"][1]["content"][0]["input"] = json!({"command":"python fixture.py --verify"});
+    let original = protocol::parse(&raw).unwrap();
+    raw["messages"][1]["content"][0]["input"]["command"] = json!("python fixture.py");
+    let changed = protocol::parse(&raw).unwrap();
+    assert_ne!(original.hashes("key"), changed.hashes("key"));
 }
 fn native(block: Value) -> Value {
     json!({"type":"claud2api_native","block":block})
@@ -637,7 +900,7 @@ fn native_context_is_omitted_when_disabled_and_changes_when_enabled() {
     assert!(
         input
             .prompt("n")
-            .contains("tool_policy applies only to client_tools")
+            .contains("tool_policy.type=none prohibits all tools")
     );
     assert!(input.prompt("n").contains("<tool_call_n>"));
 }

@@ -447,12 +447,13 @@ dependencies = [
 
 [[package]]
 name = "claud2api"
-version = "0.1.0-alpha.6.1"
+version = "0.1.0-alpha.7"
 dependencies = [
  "aes-gcm",
  "async-stream",
  "axum",
  "axum-server",
+ "base64",
  "bytes",
  "chrono",
  "chrono-tz",

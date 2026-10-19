@@ -131,6 +131,9 @@ pub fn resolve(raw: &Value, settings: &Settings) -> Result<Vec<String>> {
             ));
         }
     }
+    if raw.pointer("/tool_choice/type").and_then(Value::as_str) == Some("none") {
+        return Ok(Vec::new());
+    }
     Ok(GROUPS
         .iter()
         .filter(|group| selected.contains(**group))

@@ -2,7 +2,7 @@
 
 [中文](DEVELOPMENT_ZH.md) · English · [Documentation index](DOCS.md)
 
-This guide describes **v0.1.0-alpha.4** as implemented in this repository. Start
+This guide describes the current source; see the [changelog](CHANGELOG_EN.md) for version changes. Start
 with [installation](DEPLOY_EN.md) and the [public API](API.md) if you only need to
 run the service. Interface details live in the linked reference documents; this
 guide explains ownership, invariants and how to change the implementation safely.
@@ -38,15 +38,17 @@ accepted API field does not imply the corresponding native API capability.
 | [src/config.rs](src/config.rs) | Startup configuration, credentials and validated runtime settings |
 | [src/web.rs](src/web.rs) | Public authentication, response lifetime, Messages JSON/SSE |
 | [src/protocol.rs](src/protocol.rs) | Input projection, transcript/tool validation, identities and tool-frame decoding |
+| [src/media.rs](src/media.rs) | Bounded input media in memory, safe metadata references and upload selection |
 | [src/native_tools.rs](src/native_tools.rs) | Native web tool groups, settings and descriptors |
 | [src/native_stream.rs](src/native_stream.rs) | Native tool lifecycles, structured results and citations |
+| [src/native_output.rs](src/native_output.rs) | Text projection of native results, citations and file links for standard clients |
 | [src/native_files.rs](src/native_files.rs) | Expiring generated-file downloads scoped to the API token |
 | [src/models.rs](src/models.rs) | Published model IDs, exact aliases and native resolution |
 | [src/tokens.rs](src/tokens.rs) | Managed credentials, digests and token admission |
 | [src/guard.rs](src/guard.rs) | Request cancellation/deadlines, account pool and single-account leases |
 | [src/engine.rs](src/engine.rs) | Session reservation/ownership, migration, summaries and cleanup |
 | [src/turn.rs](src/turn.rs) | One generation attempt, context projection and successful state commit |
-| [src/transport.rs](src/transport.rs) | Upstream HTTP, model observation and SSE reading |
+| [src/transport.rs](src/transport.rs) | Upstream HTTP, input file upload, model observation and SSE reading |
 | [src/browser.rs](src/browser.rs) | Supported browser bundles and account proxy validation |
 | [src/store.rs](src/store.rs) | Encrypted snapshot, SQLite transactions, migrations and durable records |
 | [src/observability.rs](src/observability.rs) | Request spans, terminal status and per-attempt Token counters |
@@ -68,6 +70,7 @@ The console uses plain DOM JavaScript. There is no separate frontend package
 installation or bundler. Rust `include_str!` embeds its files; rebuild the binary
 or image after changing UI assets. Preserve persisted encryption domains and
 state fingerprints when changing request adapters.
+Explicit client-tool `input_schema.default` values guide model arguments; the gateway does not fill them or relax validation. `default` is a [JSON Schema annotation](https://json-schema.org/understanding-json-schema/reference/annotations). History fingerprints equate omitted and explicit top-level optional primitive defaults only for conservatively allowlisted schemas, and only when both original and normalized arguments pass full validation. Required properties, conditional constraints, complex defaults and actual argument edits remain distinct. Tool inputs are unchanged. Persisted fingerprints from the old algorithm may trigger one rebuild on the first continuation after upgrading.
 
 ## 3. Local development
 
@@ -271,22 +274,30 @@ and proxy with a maximum eight-second wait. Read-only configuration polling is
 local. Fetching records an observation without changing mappings or their
 revision; the UI merges missing entries into an unsaved draft. Saving is separate.
 
-Client tools are encoded in a nonce-delimited text protocol and validated against
-the declared schemas. Messages can also enable web search/fetch, remote Artifacts,
-remote code/file tools, all 37 current web information/interaction widgets and
-bound-project knowledge search through administrator settings and per-request
-selection. Project search requires a canonical UUID; never enumerate private
-projects from an account. Native tools run in Claude's remote environment; the
-gateway never runs commands locally or fabricates results.
-`claud2api_native` blocks must pass protocol validation and round-trip unchanged
-in complete history; each native call/result pair stays within one assistant turn.
-Settings, project UUID and request selection participate in the session
-fingerprint, and internal summaries keep native tools off. Generated files use an
-encrypted, token-owner-bound download handle; cap downloads at 32 MiB and retain
-the originating web conversation until handle expiry. Ignore unsupported optional controls
-only at their declared boundary: a `thinking` key inside tool input is business
-data. Do not recursively strip it. Remote/file schema loading is disabled. New
-block types need explicit protocol support, not a generic cast.
+Client tools use real web function descriptors and the `/tool_result` channel, validated against their declared schemas. Upstream aliases are distinct from client names and remote tools. After downstream `tool_use`, the gateway retains the upstream stream and account lease in memory; only matching token, history and call IDs resume it. The sidechannel sends only the client's returned result, without policy, system instructions or extra text. Ordinary `auto` can resume the same upstream stream; an initial `any`/named `tool` constrains only the current response, so returning its pure result with `auto` can still resume. A follow-up `any`, `tool` or `none`, added user text or appended system instruction starts a fresh completion from the full validated history. Claude Code appends system content to each tool-result request, so a fresh completion first calls `stop_response` for the previous response.
+
+If the fresh request fails before upstream generation starts, only an exact retry with the same token, complete history (including the result), context and tool choice is accepted, within `min(request_timeout, 600 seconds)`. Receipts store keyed digests, not result bodies, and are capped at 512. If stopping the previous response failed, retry must use the original account and stop it first. If generation starts and is then interrupted, retrying its old result returns 409. Expired or restarted state is unrecoverable: the old result returns 409 and that state is cleared. A request that does not match a still-valid receipt also returns 409, but leaves the receipt available for the correct retry. Never replay a client tool. See the [test summary (Chinese)](TEST_SUMMARY.md) for current test results and limits. A PDF tool result also uses a fresh completion and media upload; the direct PDF sidechannel was verified to return HTTP 400.
+
+Waiting lasts at most the smaller of the request timeout and 600 seconds, and never beyond 840 seconds from the upstream stream start. Abnormal disconnection, expiry and shutdown release it. Restart cannot recover the stream: stale results receive 409 and require a new conversation, without silently replaying them as a new task. The account slot remains occupied while waiting. Messages can enable web search/fetch, remote Artifacts,
+remote code/file tools, the current web widget descriptors and bound-project
+knowledge search through administrator settings and per-request selection.
+Project search requires a canonical UUID; never enumerate private projects from
+an account. Native tools run in Claude's remote environment; the gateway never
+runs commands locally or fabricates results. The Messages API defaults to standard text
+output for native results, citations and file links. Setting
+`claud2api_native_output` to `extensions` opts into structured native blocks and
+their SSE lifecycle. In that mode, blocks must pass protocol validation and round-trip unchanged in
+complete history; each native call/result pair stays within one assistant turn.
+When native groups are enabled, the output mode and group selection participate
+in the context fingerprint. `turn` must commit the same visible transcript it
+returned; do not
+filter extensions in `web` alone, or the next client history can stop matching.
+Internal summaries keep native tools off. Generated files use an encrypted,
+token-owner-bound download handle; cap downloads at 32 MiB and retain the
+originating web conversation until handle expiry. Ignore unsupported optional
+controls only at their declared boundary: a `thinking` key inside tool input is
+business data. Do not recursively strip it. Remote/file schema loading is
+disabled. New block types need explicit protocol support, not a generic cast.
 
 Profiles are the exact supported `wreq`/`wreq-util` bundles: Chrome Windows 146–152
 and Firefox Windows 144–151. A profile change requires an idle account and preserves
@@ -321,8 +332,15 @@ Status records retain requested model, owner/name, account, direction, phase,
 status, bytes/chunks and optional estimated Token counters. Downstream input
 includes cache creation/read; successful output is published only after successful
 body EOF. Upstream attempts count their own prompts and received text/thinking/
-partial-JSON fragments. Unknown failure output is `null`; a successful empty
-output may be zero. Partial output remains explicitly incomplete.
+partial-JSON fragments. Final downstream records may include `native_tools`, an
+ordered list of allowlisted tool names and `started`, `completed` or `error`
+result status. It contains no tool ID, input, result body, URL or credential.
+`null` means activity is unknown, including for old records; `[]` means a
+complete observation found no native tool calls. `native_tools_complete` is
+`true` after complete decoding, `false` for a partial or truncated list, and
+`null` when unknown. The audit retains at most 128 calls. Unknown failure output is
+`null`; a successful empty output may be zero. Partial output remains explicitly
+incomplete.
 
 Status retention is bounded to 10000 records/seven days. The usage ledger is a
 different table and is not truncated to that window. The separate Bot `/usage`
@@ -371,8 +389,9 @@ node --check ui/versions.js
 python3 scripts/update_acceptance.py --artifacts /tmp/claud2api-update-acceptance --build
 ```
 
-Node is needed for these syntax checks, not for the shipped runtime. Use the
-current Cargo test report for test counts. The adapters are checked against
+Node is needed for these syntax checks, not for the shipped runtime. The final
+test count belongs in the final verification record; this document does not fix
+the count. The adapters are checked against
 explicit input, output, error and usage requirements rather than old snapshots.
 
 | Test area | Important assertions |

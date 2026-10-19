@@ -38,6 +38,60 @@ pub struct CompletionRequest<'a> {
     pub prompt: &'a str,
     pub tools: Value,
     pub thinking: &'a str,
+    pub uploads: &'a [crate::media::Upload],
+}
+
+enum RequestPayload<'a> {
+    Json(&'a Value),
+    ToolResult(&'a Value),
+    Upload(&'a crate::media::Upload),
+}
+
+const MAX_TOOL_RESULT_RESPONSE_BYTES: usize = 1 << 20;
+const TOOL_RESULT_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(200),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+];
+
+fn valid_tool_use_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 200 && !value.chars().any(char::is_control)
+}
+
+fn tool_result_payload(
+    target: &str,
+    tool_use_id: &str,
+    content: Value,
+    is_error: Option<bool>,
+) -> Result<Value> {
+    if !is_canonical_uuid(target)
+        || !valid_tool_use_id(tool_use_id)
+        || !content.as_array().is_some_and(|items| !items.is_empty())
+    {
+        return Err(Fault::invalid("invalid native tool result"));
+    }
+    let mut payload = json!({
+        "type": "tool_result",
+        "tool_use_id": tool_use_id,
+        "content": content,
+    });
+    if let Some(is_error) = is_error {
+        payload["is_error"] = json!(is_error);
+    }
+    Ok(payload)
+}
+
+fn is_sidechannel_waiting_key_absent(status: u16, body: &[u8]) -> bool {
+    status == 404
+        && serde_json::from_slice::<Value>(body)
+            .ok()
+            .is_some_and(|event| error_code(&event) == "side_channel_waiting_key_absent")
+}
+
+fn is_error_envelope(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .is_some_and(|value| value.get("type").and_then(Value::as_str) == Some("error"))
 }
 
 // Completions target an already-created conversation. Creation preferences and
@@ -54,8 +108,8 @@ struct CompletionBody<'a> {
     effort: &'a str,
     thinking_mode: &'a str,
     rendering_mode: &'static str,
-    attachments: [Value; 0],
-    files: [Value; 0],
+    attachments: Vec<Value>,
+    files: Vec<Value>,
     sync_sources: [Value; 0],
 }
 
@@ -122,6 +176,70 @@ fn is_output_download_request(method: &Method, path: &str) -> bool {
     let mut pairs = url::form_urlencoded::parse(query.as_bytes());
     matches!(pairs.next(), Some((key, value)) if key.as_ref() == "path" && valid_output_path(value.as_ref()))
         && pairs.next().is_none()
+}
+
+fn validate_upload_reference(upload: &crate::media::Upload) -> Result<()> {
+    let reference = &upload.reference;
+    let mime = reference.media_type.as_str();
+    if upload.data.is_empty()
+        || upload.data.len() > crate::media::MAX_FILE_BYTES
+        || reference.size != upload.data.len()
+        || !matches!(
+            mime,
+            "image/png"
+                | "image/jpeg"
+                | "image/gif"
+                | "image/webp"
+                | "application/pdf"
+                | "text/plain"
+        )
+        || reference.filename.is_empty()
+        || reference.filename.len() > 128
+        || reference.filename.chars().any(char::is_control)
+        || reference.filename.contains(['\\', '/', '"'])
+        || hex::encode(Sha256::digest(&upload.data)) != reference.sha256
+    {
+        return Err(Fault::invalid("invalid media upload reference"));
+    }
+    Ok(())
+}
+
+fn multipart_body(upload: &crate::media::Upload) -> Result<(String, Vec<u8>)> {
+    validate_upload_reference(upload)?;
+    let reference = &upload.reference;
+    let mime = reference.media_type.as_str();
+
+    let boundary = format!("----WebKitFormBoundary{}", uuid::Uuid::new_v4().simple());
+    let mut body = Vec::with_capacity(upload.data.len().saturating_add(512));
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n",
+            reference.filename
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {mime}\r\n\r\n").as_bytes());
+    body.extend_from_slice(&upload.data);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    Ok((boundary, body))
+}
+
+fn inline_text_attachment(upload: &crate::media::Upload) -> Result<Value> {
+    validate_upload_reference(upload)?;
+    if upload.reference.media_type != "text/plain" || upload.data.contains(&0) {
+        return Err(Fault::invalid("invalid inline text attachment"));
+    }
+    let extracted_content = std::str::from_utf8(&upload.data)
+        .map_err(|_| Fault::invalid("inline text attachment is not UTF-8"))?;
+    Ok(json!({
+        "file_name": upload.reference.filename,
+        "file_type": upload.reference.media_type,
+        "file_size": upload.reference.size,
+        "extracted_content": extracted_content,
+        "origin": "user_upload",
+        "kind": "file"
+    }))
 }
 
 struct WebResponse {
@@ -215,25 +333,28 @@ impl WebClient {
         method: Method,
         path: &str,
         referer: &str,
-        payload: Option<&Value>,
+        payload: Option<RequestPayload<'_>>,
     ) -> Result<WebResponse> {
         lease.check().await?;
+        let allow_sidechannel_waiting_404 = matches!(&payload, Some(RequestPayload::ToolResult(_)));
         let allow_download_html = is_output_download_request(&method, path);
         let mode = if path.ends_with("/completion") {
             "sse"
         } else {
             "json"
         };
-        let mut span = scope.trace.as_ref().map(|trace| {
-            trace.span(
-                "upstream",
-                mode,
-                crate::observability::operation(path, method.as_str()),
-                &lease.account_id,
-            )
-        });
+        let operation = if path.ends_with("/tool_result") {
+            "native_tool_result"
+        } else {
+            crate::observability::operation(path, method.as_str())
+        };
+        let mut span = scope
+            .trace
+            .as_ref()
+            .map(|trace| trace.span("upstream", mode, operation, &lease.account_id));
         if path.ends_with("/completion")
-            && let Some(prompt) = payload.and_then(|v| v["prompt"].as_str())
+            && let Some(RequestPayload::Json(payload)) = payload.as_ref()
+            && let Some(prompt) = payload["prompt"].as_str()
             && let Some(span) = &mut span
         {
             span.input_tokens(crate::protocol::estimate(prompt));
@@ -243,6 +364,22 @@ impl WebClient {
             .split_once('-')
             .map(|(base, _)| format!("{},{base};q=0.9", self.locale))
             .unwrap_or_else(|| self.locale.clone());
+        let multipart = match payload.as_ref() {
+            Some(RequestPayload::Upload(upload)) => match multipart_body(upload) {
+                Ok(multipart) => Some(multipart),
+                Err(fault) => {
+                    if let Some(span) = &mut span {
+                        span.failed(&fault);
+                    }
+                    return Err(fault);
+                }
+            },
+            _ => None,
+        };
+        let content_type = multipart
+            .as_ref()
+            .map(|(boundary, _)| format!("multipart/form-data; boundary={boundary}"))
+            .unwrap_or_else(|| "application/json".to_owned());
         let mut request = self
             .http
             .request(method, format!("{}{path}", self.base))
@@ -263,9 +400,14 @@ impl WebClient {
             .header("sec-fetch-dest", "empty")
             .header("sec-fetch-mode", "cors")
             .header("sec-fetch-site", "same-origin")
-            .header("content-type", "application/json");
-        if let Some(body) = payload {
-            request = request.json(body);
+            .header("content-type", content_type);
+        match (payload, multipart) {
+            (Some(RequestPayload::Json(body) | RequestPayload::ToolResult(body)), _) => {
+                request = request.json(body)
+            }
+            (Some(RequestPayload::Upload(_)), Some((_, body))) => request = request.body(body),
+            (None, _) => {}
+            _ => unreachable!("multipart request payload is prepared above"),
         }
         let response = match scope
             .wait(async { request.send().await.map_err(|_| Fault::upstream()) })
@@ -300,7 +442,7 @@ impl WebClient {
             drop(response);
             return Err(lease.failure(403, None).await?);
         }
-        if status >= 400 {
+        if status >= 400 && !(allow_sidechannel_waiting_404 && status == 404) {
             if let Some(span) = &mut span {
                 span.finish(status);
             }
@@ -310,6 +452,9 @@ impl WebClient {
         Ok(WebResponse { response, span })
     }
     async fn decode(response: WebResponse, scope: &Scope) -> Result<Value> {
+        Self::decode_limited(response, scope, 4 << 20).await
+    }
+    async fn decode_limited(response: WebResponse, scope: &Scope, limit: usize) -> Result<Value> {
         let WebResponse { response, mut span } = response;
         let status = response.status().as_u16();
         let result = async {
@@ -320,7 +465,7 @@ impl WebClient {
                 if let Some(span) = &mut span {
                     span.chunk(chunk.len());
                 }
-                if body.len() + chunk.len() > 4 << 20 {
+                if body.len().saturating_add(chunk.len()) > limit {
                     return Err(Fault::upstream());
                 }
                 body.extend_from_slice(&chunk);
@@ -332,6 +477,42 @@ impl WebClient {
             span.finish(result.as_ref().err().map_or(status, |f| f.status));
         }
         result
+    }
+    async fn response_body_limited(
+        response: WebResponse,
+        lease: &Lease,
+        scope: &Scope,
+        limit: usize,
+    ) -> Result<(u16, Vec<u8>, Option<crate::observability::Span>)> {
+        let WebResponse { response, mut span } = response;
+        let status = response.status().as_u16();
+        let result = async {
+            let mut stream = response.bytes_stream();
+            let mut body = Vec::new();
+            while let Some(chunk) = scope.wait(async { Ok(stream.next().await) }).await? {
+                lease.check().await?;
+                let chunk = chunk.map_err(|_| Fault::upstream())?;
+                if let Some(span) = &mut span {
+                    span.chunk(chunk.len());
+                }
+                if body.len().saturating_add(chunk.len()) > limit {
+                    return Err(Fault::upstream());
+                }
+                body.extend_from_slice(&chunk);
+            }
+            lease.check().await?;
+            Ok(body)
+        }
+        .await;
+        match result {
+            Ok(body) => Ok((status, body, span)),
+            Err(fault) => {
+                if let Some(span) = &mut span {
+                    span.failed(&fault);
+                }
+                Err(fault)
+            }
+        }
     }
     pub async fn organization(&self, lease: &Lease, scope: &Scope) -> Result<String> {
         let mut org = self.org.lock().await;
@@ -392,12 +573,66 @@ impl WebClient {
         *cache = (now() + 300, ids.clone());
         Ok(ids)
     }
+    async fn upload_file(
+        &self,
+        lease: &Lease,
+        scope: &Scope,
+        org: &str,
+        conversation: &str,
+        upload: &crate::media::Upload,
+    ) -> Result<Value> {
+        let org = url::form_urlencoded::byte_serialize(org.as_bytes()).collect::<String>();
+        let path = format!("/api/{org}/upload");
+        let response = self
+            .request(
+                lease,
+                scope,
+                Method::POST,
+                &path,
+                &format!("/chat/{conversation}"),
+                Some(RequestPayload::Upload(upload)),
+            )
+            .await?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            let mut response = response;
+            if let Some(span) = &mut response.span {
+                span.finish(status);
+            }
+            return Err(Fault::upstream());
+        }
+        let data = Self::decode_limited(response, scope, 12 << 20).await?;
+        if data.get("type").and_then(Value::as_str) == Some("error") {
+            return Err(Fault::upstream());
+        }
+        let file_uuid = data
+            .get("file_uuid")
+            .and_then(Value::as_str)
+            .filter(|value| is_canonical_uuid(value))
+            .ok_or_else(Fault::upstream)?;
+        let file_kind = data
+            .get("file_kind")
+            .and_then(Value::as_str)
+            .filter(|value| {
+                !value.is_empty() && value.len() <= 64 && !value.chars().any(char::is_control)
+            })
+            .ok_or_else(Fault::upstream)?;
+        let _ = (file_uuid, file_kind);
+        Ok(data)
+    }
     pub async fn create(&self, lease: &Lease, scope: &Scope) -> Result<String> {
         let org = self.organization(lease, scope).await?;
         let path = format!("/api/organizations/{org}/chat_conversations");
         let payload = json!({"name":"Claud2Api","organization_uuid":org});
         let response = self
-            .request(lease, scope, Method::POST, &path, "/new", Some(&payload))
+            .request(
+                lease,
+                scope,
+                Method::POST,
+                &path,
+                "/new",
+                Some(RequestPayload::Json(&payload)),
+            )
             .await?;
         if !matches!(response.status().as_u16(), 200 | 201) {
             return Err(Fault::upstream());
@@ -438,6 +673,121 @@ impl WebClient {
             _ => Err(Fault::upstream()),
         }
     }
+    /// Stop the suspended web generation before replacing it. Closing its HTTP
+    /// stream alone does not release the upstream generation slot.
+    pub async fn stop_response(&self, lease: &Lease, scope: &Scope, target: &str) -> Result<()> {
+        if !is_canonical_uuid(target) {
+            return Err(Fault::invalid("invalid physical conversation id"));
+        }
+        let org = self.organization(lease, scope).await?;
+        let path = format!("/api/organizations/{org}/chat_conversations/{target}/stop_response");
+        let response = match self
+            .request(
+                lease,
+                scope,
+                Method::POST,
+                &path,
+                &format!("/chat/{target}"),
+                None,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(fault) if fault.status == 404 => return Ok(()),
+            Err(fault) => return Err(fault),
+        };
+        let (status, body, mut span) =
+            Self::response_body_limited(response, lease, scope, MAX_TOOL_RESULT_RESPONSE_BYTES)
+                .await?;
+        if !(200..300).contains(&status) || is_error_envelope(&body) {
+            let fault = Fault::upstream();
+            if let Some(span) = &mut span {
+                span.failed(&fault);
+            }
+            return Err(fault);
+        }
+        if let Some(span) = &mut span {
+            span.finish(status);
+        }
+        Ok(())
+    }
+
+    pub async fn tool_result(
+        &self,
+        lease: &Lease,
+        scope: &Scope,
+        target: &str,
+        tool_use_id: &str,
+        content: Value,
+        is_error: Option<bool>,
+    ) -> Result<()> {
+        let payload = tool_result_payload(target, tool_use_id, content, is_error)?;
+        let org = self.organization(lease, scope).await?;
+        let path = format!("/api/organizations/{org}/chat_conversations/{target}/tool_result");
+        let referer = format!("/chat/{target}");
+
+        for attempt in 0..=TOOL_RESULT_RETRY_DELAYS.len() {
+            if attempt > 0 {
+                let delay = TOOL_RESULT_RETRY_DELAYS[attempt - 1];
+                scope
+                    .wait(async {
+                        tokio::time::sleep(delay).await;
+                        Ok(())
+                    })
+                    .await?;
+            }
+
+            let response = self
+                .request(
+                    lease,
+                    scope,
+                    Method::POST,
+                    &path,
+                    &referer,
+                    Some(RequestPayload::ToolResult(&payload)),
+                )
+                .await?;
+            let (status, body, mut span) =
+                Self::response_body_limited(response, lease, scope, MAX_TOOL_RESULT_RESPONSE_BYTES)
+                    .await?;
+
+            if is_sidechannel_waiting_key_absent(status, &body) {
+                if let Some(span) = &mut span {
+                    span.finish(status);
+                }
+                if attempt < TOOL_RESULT_RETRY_DELAYS.len() {
+                    continue;
+                }
+                return Err(lease.failure(status, None).await?);
+            }
+
+            if status >= 400 {
+                if let Some(span) = &mut span {
+                    span.finish(status);
+                }
+                return Err(lease.failure(status, None).await?);
+            }
+            if !(200..300).contains(&status) {
+                let fault = Fault::upstream();
+                if let Some(span) = &mut span {
+                    span.failed(&fault);
+                }
+                return Err(fault);
+            }
+            if is_error_envelope(&body) {
+                let fault = Fault::upstream();
+                if let Some(span) = &mut span {
+                    span.failed(&fault);
+                }
+                return Err(fault);
+            }
+            if let Some(span) = &mut span {
+                span.finish(status);
+            }
+            return Ok(());
+        }
+        Err(Fault::upstream())
+    }
     pub async fn bind_project(
         &self,
         lease: &Lease,
@@ -461,7 +811,7 @@ impl WebClient {
                 Method::PUT,
                 &path,
                 &format!("/chat/{target}"),
-                Some(&payload),
+                Some(RequestPayload::Json(&payload)),
             )
             .await?;
         let status = response.status().as_u16();
@@ -551,8 +901,20 @@ impl WebClient {
             prompt,
             tools: native_tools,
             thinking,
+            uploads,
         } = request;
         let org = self.organization(lease, scope).await?;
+        let mut attachments = Vec::new();
+        let mut files = Vec::new();
+        for upload in uploads {
+            if upload.reference.media_type == "text/plain" {
+                attachments.push(inline_text_attachment(upload)?);
+            } else {
+                let data = self.upload_file(lease, scope, &org, id, upload).await?;
+                let file_uuid = data["file_uuid"].as_str().ok_or_else(Fault::upstream)?;
+                files.push(json!(file_uuid));
+            }
+        }
         let assistant = uuid();
         let payload = CompletionBody {
             prompt,
@@ -572,8 +934,8 @@ impl WebClient {
             effort: &self.effort,
             thinking_mode: thinking,
             rendering_mode: "messages",
-            attachments: [],
-            files: [],
+            attachments,
+            files,
             sync_sources: [],
         }
         .payload();
@@ -585,7 +947,7 @@ impl WebClient {
                 Method::POST,
                 &path,
                 &format!("/chat/{id}"),
-                Some(&payload),
+                Some(RequestPayload::Json(&payload)),
             )
             .await?;
         if response.status().as_u16() != 200 {
@@ -753,5 +1115,82 @@ impl SseDecoder {
             events.push(e);
         }
         Ok(events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TARGET: &str = "4f2a5f04-71fc-47d9-91cb-5a6a69c7dd6b";
+
+    #[test]
+    fn tool_result_payload_matches_sidechannel_contract() {
+        let content = json!([{"type":"text","text":"synthetic result"}]);
+        let payload = tool_result_payload(TARGET, "toolu_probe_1", content.clone(), None).unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "type":"tool_result",
+                "tool_use_id":"toolu_probe_1",
+                "content":content
+            })
+        );
+        assert!(payload.get("conversation_uuid").is_none());
+
+        let payload = tool_result_payload(
+            TARGET,
+            "toolu_probe_1",
+            json!([{"type":"text","text":"failed"}]),
+            Some(true),
+        )
+        .unwrap();
+        assert_eq!(payload["is_error"], true);
+    }
+
+    #[test]
+    fn tool_result_rejects_noncanonical_targets_and_invalid_ids_or_content() {
+        let content = json!([{"type":"text","text":"result"}]);
+        assert!(
+            tool_result_payload(
+                "4F2A5F04-71FC-47D9-91CB-5A6A69C7DD6B",
+                "toolu_1",
+                content.clone(),
+                None
+            )
+            .is_err()
+        );
+        assert!(tool_result_payload(TARGET, "", content.clone(), None).is_err());
+        assert!(tool_result_payload(TARGET, "toolu\n1", content.clone(), None).is_err());
+        assert!(tool_result_payload(TARGET, &"x".repeat(201), content.clone(), None).is_err());
+        assert!(tool_result_payload(TARGET, "toolu_1", json!([]), None).is_err());
+        assert!(tool_result_payload(TARGET, "toolu_1", json!("result"), None).is_err());
+    }
+
+    #[test]
+    fn only_the_exact_waiting_sidechannel_404_is_retryable() {
+        let waiting =
+            br#"{"type":"error","error":{"error_type":"side_channel_waiting_key_absent"}}"#;
+        let waiting_type =
+            br#"{"type":"error","error":{"type":"side_channel_waiting_key_absent"}}"#;
+        let unrelated = br#"{"type":"error","error":{"type":"not_found_error"}}"#;
+        assert!(is_sidechannel_waiting_key_absent(404, waiting));
+        assert!(is_sidechannel_waiting_key_absent(404, waiting_type));
+        assert!(!is_sidechannel_waiting_key_absent(400, waiting));
+        assert!(!is_sidechannel_waiting_key_absent(404, unrelated));
+        assert!(!is_sidechannel_waiting_key_absent(404, b"not json"));
+        assert_eq!(
+            TOOL_RESULT_RETRY_DELAYS.map(|delay| delay.as_millis()),
+            [200, 500, 1000]
+        );
+    }
+
+    #[test]
+    fn successful_status_with_error_envelope_is_rejected() {
+        assert!(is_error_envelope(
+            br#"{"type":"error","error":{"type":"api_error"}}"#
+        ));
+        assert!(!is_error_envelope(br#"{"type":"success"}"#));
+        assert!(!is_error_envelope(b""));
     }
 }

@@ -3,8 +3,9 @@ use crate::{
     store::{Store, nonce, now},
 };
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::{
-    Arc, Mutex, Weak,
+    Arc, LazyLock, Mutex, Weak,
     atomic::{AtomicBool, AtomicU16, Ordering},
 };
 use std::time::Instant;
@@ -68,7 +69,97 @@ pub struct StatusRecord {
     pub bytes: u64,
     pub chunks: u64,
     pub finished_at: Option<i64>,
+    /// Observed native tool names and statuses. `null` is unknown; an empty
+    /// list is meaningful only with `native_tools_complete: true`.
+    pub native_tools: Option<Vec<NativeToolAudit>>,
+    /// `true` means the native stream was fully decoded. `false` means the
+    /// recorded call list may be partial or truncated. `null` means unknown.
+    pub native_tools_complete: Option<bool>,
 }
+
+const MAX_NATIVE_TOOL_AUDIT: usize = 128;
+const NATIVE_TOOL_GROUPS: [&str; 5] = [
+    "web_search",
+    "artifacts",
+    "repl",
+    "widgets",
+    "project_knowledge",
+];
+static NATIVE_TOOL_NAMES: LazyLock<std::collections::HashSet<String>> = LazyLock::new(|| {
+    let groups = NATIVE_TOOL_GROUPS.map(str::to_owned);
+    crate::native_tools::allowed_names(&groups)
+        .into_iter()
+        .collect()
+});
+
+#[derive(Clone, Serialize)]
+pub struct NativeToolAudit {
+    pub name: String,
+    /// `started` has no matching result, `completed` returned a result block,
+    /// and `error` returned a result marked with `is_error: true`.
+    pub status: &'static str,
+}
+
+#[derive(Default)]
+struct NativeToolState {
+    observation_complete: bool,
+    truncated: bool,
+    indices: HashMap<String, usize>,
+    calls: Vec<NativeToolAudit>,
+}
+impl NativeToolState {
+    fn start(&mut self, id: &str, name: &str) {
+        if id.is_empty()
+            || id.len() > 200
+            || id.chars().any(char::is_control)
+            || !NATIVE_TOOL_NAMES.contains(name)
+            || self.indices.contains_key(id)
+        {
+            return;
+        }
+        if self.calls.len() >= MAX_NATIVE_TOOL_AUDIT {
+            self.truncated = true;
+            return;
+        }
+        let index = self.calls.len();
+        self.indices.insert(id.to_owned(), index);
+        self.calls.push(NativeToolAudit {
+            name: name.to_owned(),
+            status: "started",
+        });
+    }
+
+    fn result(&mut self, id: &str, is_error: Option<bool>) {
+        let Some(index) = self.indices.get(id).copied() else {
+            return;
+        };
+        if self.calls[index].status != "started" {
+            return;
+        }
+        self.calls[index].status = if is_error == Some(true) {
+            "error"
+        } else {
+            "completed"
+        };
+    }
+
+    fn snapshot(&self) -> (Option<Vec<NativeToolAudit>>, Option<bool>) {
+        let complete = if self.observation_complete {
+            Some(!self.truncated)
+        } else if !self.calls.is_empty() || self.truncated {
+            Some(false)
+        } else {
+            None
+        };
+        let calls = if self.observation_complete || !self.calls.is_empty() || self.truncated {
+            Some(self.calls.clone())
+        } else {
+            None
+        };
+        (calls, complete)
+    }
+}
+
 pub struct RequestTrace {
     pub id: String,
     store: Weak<Store>,
@@ -81,6 +172,7 @@ pub struct RequestTrace {
     stream: AtomicBool,
     failure: AtomicU16,
     generation_starts: Mutex<std::collections::HashMap<String, i64>>,
+    native_tools: Mutex<NativeToolState>,
 }
 impl RequestTrace {
     pub fn new(store: &Arc<Store>, route: &'static str) -> Arc<Self> {
@@ -96,6 +188,7 @@ impl RequestTrace {
             stream: AtomicBool::new(false),
             failure: AtomicU16::new(0),
             generation_starts: Mutex::new(std::collections::HashMap::new()),
+            native_tools: Mutex::new(NativeToolState::default()),
         })
     }
     pub fn bind_account(&self, id: &str) {
@@ -107,6 +200,35 @@ impl RequestTrace {
             .expect("trace generation lock")
             .get(id)
             .copied()
+    }
+    /// Records a validated native tool start. The ID is retained only in memory
+    /// to pair its result and is never included in status-log output.
+    pub fn native_start(&self, id: &str, name: &str) {
+        self.native_tools
+            .lock()
+            .expect("trace native tool lock")
+            .start(id, name);
+    }
+    /// Records completion without retaining any tool input or result content.
+    pub fn native_result(&self, id: &str, is_error: Option<bool>) {
+        self.native_tools
+            .lock()
+            .expect("trace native tool lock")
+            .result(id, is_error);
+    }
+    /// Marks that the native stream was fully decoded, distinguishing an
+    /// observed zero-call turn from a request whose tool activity is unknown.
+    pub fn native_observation_complete(&self) {
+        self.native_tools
+            .lock()
+            .expect("trace native tool lock")
+            .observation_complete = true;
+    }
+    fn native_tool_summary(&self) -> (Option<Vec<NativeToolAudit>>, Option<bool>) {
+        self.native_tools
+            .lock()
+            .expect("trace native tool lock")
+            .snapshot()
     }
     pub fn requested_model(&self, value: &str) {
         if !value.is_empty() && value.len() <= 150 && !value.chars().any(char::is_control) {
@@ -198,6 +320,8 @@ impl RequestTrace {
                 bytes: 0,
                 chunks: 0,
                 finished_at: None,
+                native_tools: None,
+                native_tools_complete: None,
             },
         };
         span.publish();
@@ -219,6 +343,10 @@ impl Span {
             record.token_id = self.trace.token_id();
             record.token_name = self.trace.token_name();
             if record.direction == "downstream" {
+                if self.done {
+                    (record.native_tools, record.native_tools_complete) =
+                        self.trace.native_tool_summary();
+                }
                 record.usage = self.trace.usage.lock().expect("trace usage lock").clone();
                 if (!self.done || record.status >= 400)
                     && let Some(usage) = &mut record.usage
@@ -315,8 +443,13 @@ impl Drop for Span {
 }
 
 pub fn operation(path: &str, method: &str) -> &'static str {
+    if method == "POST" && path.ends_with("/stop_response") {
+        return "completion_stop";
+    }
     if path.ends_with("/completion") {
         "completion"
+    } else if method == "POST" && path.starts_with("/api/") && path.ends_with("/upload") {
+        "file_upload"
     } else if path == "/api/organizations" {
         "organizations"
     } else if path.starts_with("/edge-api/") {
@@ -329,5 +462,53 @@ pub fn operation(path: &str, method: &str) -> &'static str {
         "conversation_delete"
     } else {
         "conversation_create"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn native_audit_distinguishes_unknown_empty_and_interrupted_observations() {
+        let mut state = NativeToolState::default();
+        let (calls, complete) = state.snapshot();
+        assert!(calls.is_none());
+        assert_eq!(complete, None);
+        state.start("private-call-id", "web_search");
+        state.result("private-call-id", Some(false));
+        let (calls, complete) = state.snapshot();
+        assert_eq!(complete, Some(false));
+        assert_eq!(
+            serde_json::to_value(calls).unwrap(),
+            json!([
+                {"name":"web_search","status":"completed"}
+            ])
+        );
+        state.observation_complete = true;
+        assert_eq!(state.snapshot().1, Some(true));
+        let empty = NativeToolState {
+            observation_complete: true,
+            ..Default::default()
+        };
+        assert!(empty.snapshot().0.unwrap().is_empty());
+        assert_eq!(empty.snapshot().1, Some(true));
+    }
+
+    #[test]
+    fn native_audit_capacity_is_bounded_and_cannot_be_marked_complete_after_truncation() {
+        let mut state = NativeToolState::default();
+        for index in 0..MAX_NATIVE_TOOL_AUDIT {
+            state.start(&format!("call-{index}"), "bash_tool");
+        }
+        state.start("call-0", "bash_tool");
+        assert!(!state.truncated, "a duplicate ID must not consume capacity");
+        state.start("one-call-too-many", "web_search");
+        state.observation_complete = true;
+        let (calls, complete) = state.snapshot();
+        assert_eq!(calls.unwrap().len(), MAX_NATIVE_TOOL_AUDIT);
+        assert_eq!(complete, Some(false));
+        assert_eq!(state.indices.len(), MAX_NATIVE_TOOL_AUDIT);
     }
 }

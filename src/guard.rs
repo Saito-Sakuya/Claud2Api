@@ -389,6 +389,24 @@ impl Pool {
     }
 }
 impl Lease {
+    pub(crate) fn take(&mut self) -> Result<Self> {
+        let permit = self.permit.take().ok_or_else(|| {
+            Fault::new(
+                409,
+                "conflict_error",
+                "account lease was already transferred",
+            )
+        })?;
+        Ok(Self {
+            account_id: self.account_id.clone(),
+            slot: self.slot.clone(),
+            pool: self.pool.clone(),
+            permit: Some(permit),
+            generations: std::sync::atomic::AtomicUsize::new(
+                self.generations.load(std::sync::atomic::Ordering::Acquire),
+            ),
+        })
+    }
     async fn admit(&self) -> Result<()> {
         self.pool
             .store

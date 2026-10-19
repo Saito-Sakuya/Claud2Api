@@ -265,6 +265,9 @@ impl WebBlockDecoder {
                 {
                     return Err(Fault::upstream());
                 }
+                if block.get("name").is_none() {
+                    block["name"] = json!(call.name);
+                }
                 call.result_started = true;
                 let content_seen = block.get("content").is_some();
                 emissions.push(WebEmission::NativeStart(block.clone()));
@@ -441,7 +444,9 @@ impl WebBlockDecoder {
                     ),
                     None => None,
                 };
-                let partial = if block.saw_delta {
+                // Claude web sends an empty input_json_delta for zero-argument
+                // functions. It carries no override of the initial {} input.
+                let partial = if block.saw_delta && !block.partial_json.is_empty() {
                     Some(parse_input_object(&block.partial_json)?)
                 } else {
                     None
@@ -628,6 +633,48 @@ mod tests {
     }
 
     #[test]
+    fn empty_argument_delta_preserves_initial_object_but_rejects_nonempty_invalid_json() {
+        let mut d = decoder();
+        d.feed(&start(
+            0,
+            json!({"type":"tool_use","id":"empty","name":"lookup","input":{}}),
+        ))
+        .unwrap();
+        d.feed(&delta(
+            0,
+            json!({"type":"input_json_delta","partial_json":""}),
+        ))
+        .unwrap();
+        let result = d.feed(&stop(0)).unwrap();
+        assert!(
+            matches!(&result[0], WebEmission::NativeStop(block) if block["input"] == json!({}))
+        );
+        d.feed(&start(
+            1,
+            json!({"type":"tool_result","tool_use_id":"empty","content":[]}),
+        ))
+        .unwrap();
+        d.feed(&stop(1)).unwrap();
+        d.feed(&json!({"type":"message_stop"})).unwrap();
+        d.finish().unwrap();
+
+        for invalid in [" ", "{", "[]", "null"] {
+            let mut d = decoder();
+            d.feed(&start(
+                0,
+                json!({"type":"tool_use","id":"bad","name":"lookup","input":{}}),
+            ))
+            .unwrap();
+            d.feed(&delta(
+                0,
+                json!({"type":"input_json_delta","partial_json":invalid}),
+            ))
+            .unwrap();
+            assert!(d.feed(&stop(0)).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
     fn repeated_citation_sources_and_optional_tool_presentation_updates_are_valid() {
         let mut d = decoder();
         d.feed(&start(0, json!({"type":"text","text":""}))).unwrap();
@@ -727,6 +774,7 @@ mod tests {
             WebEmission::NativeStop(block)
                 if block["content"] == json!([{"type":"text","text":"final"}])
                     && block["is_error"] == false
+                    && block["name"] == "lookup"
         ));
         decoder.finish().unwrap();
     }

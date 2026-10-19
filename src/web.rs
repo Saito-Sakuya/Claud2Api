@@ -261,11 +261,11 @@ async fn messages(
     view.request_id = trace.id.clone();
     let mut response = if stream {
         let stream = async_stream::stream! {
-            let _guard=guard;let mut events=first.into_iter();
+            let mut guard=guard;let mut events=first.into_iter();
             loop{
                 let event=if let Some(v)=events.next(){Some(v)}else{tokio::select!{v=rx.recv()=>v,_=tokio::time::sleep(std::time::Duration::from_secs(15))=>{yield Ok::<_,Infallible>(Bytes::from_static(b"event: ping\ndata: {\"type\":\"ping\"}\n\n"));continue;}}};
                 let Some(event)=event else{break;};let terminal=matches!(event,Output::Done{..}|Output::Error(_));
-                for value in view.event(event){yield Ok::<_,Infallible>(Bytes::from(format!("event: {}\ndata: {}\n\n",value["type"].as_str().unwrap_or("error"),value)));}
+                for value in view.event(event){if value["type"]=="message_stop"{guard.disarm();}yield Ok::<_,Infallible>(Bytes::from(format!("event: {}\ndata: {}\n\n",value["type"].as_str().unwrap_or("error"),value)));}
                 if terminal{break;}
             }
         };
@@ -276,7 +276,7 @@ async fn messages(
         );
         response
     } else {
-        let _guard = guard;
+        let mut guard = guard;
         let mut done = false;
         for event in first {
             done |= matches!(event, Output::Done { .. });
@@ -301,6 +301,7 @@ async fn messages(
                 }
             }
         }
+        guard.disarm();
         Json(view.document()).into_response()
     };
     for (k, v) in [
@@ -309,9 +310,9 @@ async fn messages(
         (
             "x-claud2api-limitations",
             if settings.simulated_cache {
-                "usage-estimated,max-tokens-advisory,text-tool-bridge,native-web-extensions,controls-not-forwarded,cache-simulated"
+                "usage-estimated,max-tokens-advisory,web-client-tool-channel,native-web-extensions,controls-not-forwarded,cache-simulated"
             } else {
-                "usage-estimated,max-tokens-advisory,text-tool-bridge,native-web-extensions,controls-not-forwarded"
+                "usage-estimated,max-tokens-advisory,web-client-tool-channel,native-web-extensions,controls-not-forwarded"
             },
         ),
         ("x-accel-buffering", "no"),
@@ -335,6 +336,11 @@ async fn messages(
     Ok(response)
 }
 pub struct CancelOnDrop(pub CancellationToken);
+impl CancelOnDrop {
+    fn disarm(&mut self) {
+        self.0 = CancellationToken::new();
+    }
+}
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.cancel();

@@ -2,6 +2,19 @@
 
 [中文](CHANGELOG.md) · English · [Documentation index](DOCS.md)
 
+## v0.1.0-alpha.7 · 2026-10-19
+
+- Support Messages images, PDFs, plain-text documents and tool-result attachments through real file uploads and matching history references.
+- Use real function/result channels for client tools, isolate local and remote tools, and fix zero-argument calls and continuation with optional defaults.
+- Return native results as standard text by default for Claude Code compatibility; opt into structured results with `claud2api_native_output: "extensions"`.
+- Make `tool_choice: none` disable all tools for the request. Ordinary questions do not require search merely because tools are enabled or were used earlier.
+- Stop the previous upstream generation before rebuilding for added instructions or PDF results; pure tool results can resume the same stream without accumulating waiting generations.
+- Allow bounded exact retries before generation starts, checking token, history, result and tool policy. Reject tampering, clean up expired or restarted state, and never replay executed client tools.
+- Show native tool names, status, uploads and generation stops in message logs without recording arguments or result bodies.
+- Pass 211 Rust regressions, Clippy, the optimized build and four-version local update/rollback acceptance. See the [test summary (Chinese)](https://github.com/Saito-Sakuya/Claud2Api/blob/v0.1.0-alpha.7/TEST_SUMMARY.md) for real Claude Code/Pi checks and token usage. Project, Research, connectors and some widgets remain incompletely verified.
+
+Upgrade: this is a feature release requiring manual confirmation. Retain existing data and keys, and finish pending tool tasks before upgrading.
+
 ## v0.1.0-alpha.6.1 · 2026-10-19
 
 - Install patches in the current release line automatically while retaining confirmation for feature versions; persist the panel switch, stop retrying unfinished patches, and disable automatic patches after manual rollback.

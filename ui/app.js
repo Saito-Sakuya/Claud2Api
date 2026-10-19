@@ -552,8 +552,35 @@ function renderLogs(data, append = false) {
     model_catalog: "模型目录",
     conversation_create: "创建会话",
     native_file_download: "下载生成文件",
+    file_upload: "上传图片／文档",
+    native_tool_result: "工具结果回传",
+    completion_stop: "停止上游生成",
     project_bind: "绑定项目",
     conversation_delete: "清理会话",
+  };
+  const nativeToolCell = (record) => {
+    if (!Array.isArray(record.native_tools) || !record.native_tools.length)
+      return null;
+    const statusLabels = { started: "开始", completed: "✓", error: "错误" };
+    const calls = record.native_tools.filter(
+      (item) =>
+        item &&
+        typeof item.name === "string" &&
+        Object.prototype.hasOwnProperty.call(statusLabels, item.status)
+    );
+    const entries = calls
+      .slice(0, 4)
+      .map((item) => `${item.name.slice(0, 32)} ${statusLabels[item.status]}`);
+    if (!entries.length) return null;
+    const remaining = calls.length - entries.length;
+    const partial = record.native_tools_complete === false;
+    let summary = (partial ? "未完整 · " : "") + entries.join(" · ") + (remaining > 0 ? ` +${remaining}` : "");
+    if (summary.length > 72) summary = summary.slice(0, 71) + "…";
+    const detail = document.createElement("small");
+    detail.className = "log-token-note";
+    detail.textContent = summary;
+    detail.title = (partial ? "工具观测未完整，列表可能有遗漏。" : "") + "仅记录工具名称和结果状态，不含参数、结果正文或 URL。";
+    return detail;
   };
   table(
     "log-table",
@@ -576,6 +603,12 @@ function renderLogs(data, append = false) {
       const id = document.createElement("small");
       id.textContent = record.request_id.slice(0, 16) + "…";
       id.title = record.request_id;
+      const operation = document.createElement("div");
+      const operationName = document.createElement("div");
+      operationName.textContent = operations[record.operation] || record.operation;
+      operation.append(operationName);
+      const nativeTools = nativeToolCell(record);
+      if (nativeTools) operation.append(nativeTools);
       return [
         date(record.at),
         record.token_name ||
@@ -593,7 +626,7 @@ function renderLogs(data, append = false) {
           (record.account_id ? record.account_id.slice(0, 8) : "—"),
         record.direction === "upstream" ? "上游" : "下游",
         record.mode === "sse" ? "SSE 流式" : "JSON 同步",
-        operations[record.operation] || record.operation,
+        operation,
         record.status || "—",
         number(record.elapsed_ms) + " ms",
         number(record.bytes) + " B / " + number(record.chunks),

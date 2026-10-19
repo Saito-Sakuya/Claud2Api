@@ -2,7 +2,7 @@
 
 中文 · [English](DEVELOPMENT.md) · [文档索引](DOCS_ZH.md)
 
-本文对应仓库中已实现的 **v0.1.0-alpha.4**。仅需部署或调用服务时，先阅读
+本文说明当前源码的实现；版本变更见[更新记录](CHANGELOG.md)。仅需部署或调用服务时，先阅读
 [安装说明](DEPLOY.md)和[公开 API](API_ZH.md)。接口细节由各专题文档维护；本文说明
 模块职责、状态归属、关键约束，以及如何安全地扩展和验证实现。
 
@@ -30,15 +30,17 @@ Messages 文本／客户端工具桥接，并提供网页原生工具扩展。�
 | [src/config.rs](src/config.rs) | 启动配置、账号凭证及经过校验的运行参数 |
 | [src/web.rs](src/web.rs) | 公开认证、响应生命周期、Messages JSON／SSE |
 | [src/protocol.rs](src/protocol.rs) | 输入投影、对话／工具校验、会话指纹与工具帧解码 |
+| [src/media.rs](src/media.rs) | 有界的内存附件、安全元数据引用与上传筛选 |
 | [src/native_tools.rs](src/native_tools.rs) | 网页工具组、权限开关与描述符 |
 | [src/native_stream.rs](src/native_stream.rs) | 原生工具生命周期、结构化结果及引用解码 |
+| [src/native_output.rs](src/native_output.rs) | 面向标准客户端的原生结果、引用与文件链接文本投影 |
 | [src/native_files.rs](src/native_files.rs) | 同令牌、限时的生成文件下载 |
 | [src/models.rs](src/models.rs) | 下游模型 ID、精确别名及原生目标解析 |
 | [src/tokens.rs](src/tokens.rs) | 下游令牌、摘要及令牌接入控制 |
 | [src/guard.rs](src/guard.rs) | 取消、截止时间、账号池及单账号租约 |
 | [src/engine.rs](src/engine.rs) | 会话预留与归属、迁移、摘要及远端清理 |
 | [src/turn.rs](src/turn.rs) | 单次生成尝试、上下文投影及成功状态提交 |
-| [src/transport.rs](src/transport.rs) | 上游 HTTP、模型观测及 SSE 读取 |
+| [src/transport.rs](src/transport.rs) | 上游 HTTP、输入文件上传、模型观测及 SSE 读取 |
 | [src/browser.rs](src/browser.rs) | 浏览器配置与账号代理校验 |
 | [src/store.rs](src/store.rs) | 加密快照、SQLite 事务、迁移及持久记录 |
 | [src/observability.rs](src/observability.rs) | 请求跨度、终态及每次尝试的 Token 计数 |
@@ -58,6 +60,7 @@ Messages 文本／客户端工具桥接，并提供网页原生工具扩展。�
 
 控制台使用原生 DOM JavaScript，无须安装独立前端依赖或执行打包。Rust 通过 `include_str!`
 嵌入页面；修改 UI 后需重新构建二进制或镜像。调整接口时须保留持久状态使用的加密域和指纹格式。
+客户端工具的显式 `input_schema.default` 用于提示模型选择参数，不在网关中自动补填或放宽验证；`default` 本身是 [JSON Schema 注解](https://json-schema.org/understanding-json-schema/reference/annotations)。历史指纹对符合保守 schema 白名单的顶层可选基本类型默认值做等价处理：仅当原始参数和省略默认值后的参数都通过完整校验时，省略值与显式默认值等价。required、条件约束、复杂默认值和真实参数改写不适用，仍须重建上游会话。实际工具输入不变；旧算法持久化的指纹可能在升级后首次续问时触发一次重建。
 
 ## 3. 本地开发
 
@@ -217,13 +220,19 @@ API 令牌无须轮换网关密钥。
 管理员主动获取上游目录时，使用现有账号锁、浏览器配置及代理，最长等待 8 秒。配置轮询仅读本地。
 获取仅保存观测，不修改模型映射或其 revision；控制台将缺少的模型加入未保存草稿，保存是独立操作。
 
-客户端工具通过带随机分隔符的文本协议表达，并按声明的 schema 校验。Messages 还可按管理员设置和请求配置开放
-网页搜索／读取、远端 Artifacts、代码／文件沙箱、网页端 37 种信息与交互组件，以及指定项目知识搜索。
-项目知识须绑定一个规范 UUID，不能枚举账号私有项目。原生工具在 Claude 远端执行；网关不在本机执行命令，也不伪造结果。
+客户端工具通过网页真实函数定义与 `/tool_result` 通道传输，并按声明的 schema 校验；上游别名与客户端原名分开，避免同名远端工具混淆。下游返回标准 `tool_use` 后，网关在内存中保留上游流和账号许可；后续同令牌、历史及调用 ID 的结果才可续接。工具结果 sidechannel 只发送客户端返回值，不夹带策略、system 指令或额外说明。普通 `auto` 可续接同一上游流；首轮 `any`／`tool` 只约束当前响应，之后以 `auto` 回传纯结果仍可续接。后续改成 `any`／`tool`／`none`、追加 user 文本或 system 指令时，必须用完整已验证历史启动新生成；`none` 的新回合不带工具。Claude Code 每次工具结果请求都会追加 system 内容，因此新生成前先用 `stop_response` 停止旧响应，才能避免前序生成与账号资源重叠。
+
+若 fresh 请求在上游生成开始前失败，只有相同令牌、完整历史（包括工具结果）、上下文和工具选择才可在 `min(request_timeout, 600 秒)` 内重试。回执只保存 keyed digest，不保存结果正文，最多 512 条；若停止旧响应失败，重试必须回到原账号并先完成停止。生成开始后若中断，旧结果重试返回 409；回执过期或服务重启后状态不可恢复，旧结果返回 409 并清理。请求与仍有效回执不匹配也返回 409，但保留回执供正确请求重试。网关不重放客户端工具。测试结果见[综测结果](TEST_SUMMARY.md)。工具结果含 PDF 时也启动新生成并通过媒体上传传递，不向 sidechannel 发送 PDF；已确认直接 PDF sidechannel 返回 HTTP 400。
+
+等待时限取请求超时与 600 秒的较小值，且不超过该上游流启动后 840 秒；异常断连、超时、关闭服务都会释放等待项。进程重启后等待流不可恢复，旧结果返回 409，客户端须重开会话；不会把旧结果静默重放为新任务。等待期间账号槽位保持占用。Messages 还可按管理员设置和请求配置开放
+网页搜索／读取、远端 Artifacts、代码／文件沙箱、当前网页组件描述符，以及指定项目知识搜索。项目知识须绑定一个规范 UUID，
+不能枚举账号私有项目。原生工具在 Claude 远端执行；网关不在本机执行命令，也不伪造结果。Messages 默认把原生结果、引用和文件链接
+投影为标准文本；设置 `claud2api_native_output` 为 `extensions` 才返回结构化原生块及对应 SSE 生命周期。此模式下，
 `claud2api_native` 内容块必须经协议校验并在完整历史中原样往返；原生调用与结果须在同一 assistant 轮配对。
-控制台配置、项目 UUID 和请求选择进入会话指纹，内部摘要关闭原生工具。远端文件只通过同令牌所有者、加密且限时的
-`claud2api_download_url` 读取，下载限 32 MiB；对应上游会话会保留到链接过期。工具 input 中的 `thinking` 属于业务数据，不能递归删除。
-禁止加载远程／文件 schema；新增内容块必须明确实现协议，不能笼统强转。
+启用原生工具组时，工具组和输出模式进入上下文指纹。turn 提交的历史必须与返回客户端的可见内容一致；不能只在 web 层过滤扩展块，否则下一轮历史前缀会失配。
+内部摘要关闭原生工具。远端文件只通过同令牌所有者、加密且限时的 `claud2api_download_url` 读取，下载限 32 MiB；
+对应上游会话会保留到链接过期。工具 input 中的 `thinking` 属于业务数据，不能递归删除。禁止加载远程／文件 schema；
+新增内容块必须明确实现协议，不能笼统强转。
 
 浏览器配置必须对应 `wreq`／`wreq-util` 实际支持的组合：Chrome Windows 146–152、Firefox Windows
 144–151。更换配置要求账号空闲，并保留账号身份、原信号量、会话／检查点／缓存状态和 revision 校验。
@@ -253,6 +262,9 @@ API 令牌无须轮换网关密钥。
 下游输入已包含缓存创建／读取；只有响应体成功完整结束才发布最终输出。上游按各次尝试分别统计 prompt
 及收到的 text／thinking／partial-JSON 片段。失败且未知的输出为 `null`，正常结束且为空才可为 0；
 部分输出必须明确标记未完成。
+最终下游记录可包含 `native_tools`：按调用顺序列出允许的工具名及 `started`、`completed` 或 `error` 状态；
+不包含工具 ID、参数、结果正文、URL 或凭证。`null` 表示调用情况未知（包括旧记录），`[]` 表示已完整观测且本轮没有原生工具调用。
+`native_tools_complete` 为 `true` 表示完整解码，`false` 表示列表可能不完整或已截断，`null` 表示未知。最多保留 128 次调用。
 
 状态日志最多保留 10000 条／7 天；用量账本属于另一张表，不按此窗口截断。
 独立 Bot `/usage` 汇总仍有 10000 条上限并返回 truncated；完整账本统计使用 `/analytics`。统计采用配置的 IANA 日历
@@ -290,7 +302,7 @@ node --check ui/versions.js
 python3 scripts/update_acceptance.py --artifacts /tmp/claud2api-update-acceptance --build
 ```
 
-Node 只用于这些语法检查，服务运行不依赖 Node。测试数量以当前 Cargo 报告为准。
+Node 只用于这些语法检查，服务运行不依赖 Node。最终测试数量以最终验证记录为准，本文件不固定数量。
 兼容接口按输入、输出、错误和用量需求验证，不再与旧输出快照逐字比较。
 
 | 测试范围 | 关键断言 |

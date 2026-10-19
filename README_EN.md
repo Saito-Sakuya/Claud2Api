@@ -4,7 +4,7 @@
 
 <h1 align="center">Claud2Api</h1>
 
-<p align="center"><strong>v0.1.0-alpha.6.1</strong></p>
+<p align="center"><strong>v0.1.0-alpha.7</strong></p>
 
 <p align="center">
   <a href="DEPLOY_EN.md"><img src="docs/badges/linux-amd64.svg" alt="Supported platform: Linux AMD64" height="26" /></a>
@@ -18,11 +18,13 @@ console for accounts, browser profiles, account proxies, model configuration,
 API tokens, sessions, estimated usage and message-status logs.
 Messages can also use Claude web search/fetch, Artifacts, remote code/file tools,
 information widgets and a specified project's knowledge, subject to account access.
+Alpha7 adds image/PDF/text attachments and real client-tool channels, returning native results as standard text by default. See [test summary (Chinese)](TEST_SUMMARY.md) for real-client validation and remaining gaps.
 
 ## Installation
 
 Docker Compose on a Linux AMD64 VPS is the recommended deployment. Access the
 console through an SSH tunnel.
+Images are available after the matching Release is published. Before then, pin an existing release with `CLAUD2API_IMAGE` or [build from source](DEPLOY_EN.md).
 
 Obtain the source, enter its directory and prepare protected configuration:
 

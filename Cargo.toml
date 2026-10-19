@@ -1,6 +1,6 @@
 [package]
 name = "claud2api"
-version = "0.1.0-alpha.6.1"
+version = "0.1.0-alpha.7"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -14,6 +14,7 @@ tokio = { version = "=1.53.3", features = ["macros", "rt-multi-thread", "net", "
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
+base64 = "=0.22.1"
 sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled"] }
 wreq = { version = "=0.16.1", default-features = false, features = ["tokio-rt", "chromium-roots", "cookies", "gzip", "deflate", "brotli", "zstd", "stream", "json", "socks"] }
 wreq-util = { git = "https://github.com/0x676e67/wreq-util", rev = "8dbbfe9d945ef36a6293951251802ebea19948e0", default-features = false, features = ["emulation", "tokio-rt", "emulation-compression", "emulation-chromium-pki"] }

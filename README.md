@@ -4,7 +4,7 @@
 
 <h1 align="center">Claud2Api</h1>
 
-<p align="center"><strong>v0.1.0-alpha.6.1</strong></p>
+<p align="center"><strong>v0.1.0-alpha.7</strong></p>
 
 <p align="center">
   <a href="DEPLOY.md"><img src="docs/badges/linux-amd64.svg" alt="支持系统：Linux AMD64" height="26" /></a>
@@ -16,10 +16,12 @@
 Claud2Api 提供兼容 Messages API 的服务及私有管理控制台，支持账号管理、浏览器配置、
 账号代理、模型配置、令牌管理、会话管理、用量估算与消息状态日志。
 Messages 还可调用 Claude 网页端的搜索与读取、Artifacts、远端代码／文件工具、信息卡片及指定项目知识；具体能力取决于账号权限。
+alpha7 补齐图片／PDF／文本附件和真实客户端工具通道，原生结果默认以标准文本返回。工具实测、Token 用量及未覆盖能力见[综测结果](TEST_SUMMARY.md)。
 
 ## 安装
 
 推荐在 Linux AMD64 VPS 上使用 Docker Compose。控制台通过 SSH 隧道访问。
+镜像在对应版本 Release 发布后提供；发布前可用 `CLAUD2API_IMAGE` 固定现有发行版，或按[安装说明](DEPLOY.md)从源码构建。
 
 取得源码后，进入项目目录，准备配置文件：
 

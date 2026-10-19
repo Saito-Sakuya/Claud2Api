@@ -230,6 +230,8 @@ Retention is at most 10000 records/seven days. Unfinished records after a crash
 are marked interrupted. Streaming HTTP 200 only confirms headers; terminal errors
 still belong in error results. No chat text, internal summaries, Cookie or proxy
 passwords are stored.
+Final downstream records may include `native_tools`, containing only allowlisted names and `started`/`completed`/`error` status, without tool IDs, arguments, result bodies or URLs.
+`native_tools_complete: true` means decoding finished, so `[]` confirms no native calls. `false` marks a possibly partial or truncated list (at most 128 calls). Both fields are `null` for legacy records or unknown activity.
 
 Generation records may contain `usage`; older records/non-generation operations
 use null, never fabricated backfill or zero:

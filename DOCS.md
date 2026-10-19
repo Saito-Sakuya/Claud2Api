@@ -2,7 +2,7 @@
 
 [中文](DOCS_ZH.md) · English
 
-These documents describe **v0.1.0-alpha.6.1**. Every maintained project guide has a
+The source version is **v0.1.0-alpha.7**. See the [changelog](CHANGELOG_EN.md) and [test summary (Chinese)](TEST_SUMMARY.md); GitHub Releases show publication status. Every maintained project guide has a
 complete Chinese/English counterpart. Existing default filenames remain valid;
 use the language links below or at the top of each guide.
 
@@ -17,12 +17,13 @@ use the language links below or at the top of each guide.
 
 | Topic | 中文 | English | Contents |
 |---|---|---|---|
-| Release files | [发行文件说明](RELEASES_ZH.md) | [Release files](RELEASES.md) | alpha4–alpha6.1, Docker tags and downloadable assets |
+| Release files | [发行文件说明](RELEASES_ZH.md) | [Release files](RELEASES.md) | alpha4–alpha7, Docker tags and downloadable assets |
 | Managed updates | [版本管理](UPDATES_ZH.md) | [Version manager](UPDATES.md) | Checking for updates, upgrading and rolling back |
 | Overview | [README](README.md) | [README](README_EN.md) | Installation, console usage, API entry and disclaimer |
 | Developer guide | [开发者文档](DEVELOPMENT_ZH.md) | [Developer guide](DEVELOPMENT.md) | Architecture, resource/state ownership, extension, testing and releases |
 | Installation | [安装与运行](DEPLOY.md) | [Installation](DEPLOY_EN.md) | Native/Compose setup, complete environment reference and backup |
 | Public API | [API 文档](API_ZH.md) | [API contract](API.md) | Authentication, models, Messages/tools/SSE and limitations |
+| Test summary | [简要综测表](TEST_SUMMARY.md) | [Test summary (Chinese)](TEST_SUMMARY.md) | Tool checks, token usage and regression results |
 | Control API | [控制台接口](CONTROL_API.md) | [Control API](CONTROL_API_EN.md) | Accounts, models, tokens, settings, logs, analytics and Bot reads |
 | Bridge model IDs | [桥接模型 ID](BRIDGE_COMPATIBILITY_ZH.md) | [Bridge model IDs](BRIDGE_COMPATIBILITY.md) | Native, c2a- and configured model naming |
 | Compatibility controls | [参数兼容](SUB2API_COMPATIBILITY_ZH.md) | [Compatibility controls](SUB2API_COMPATIBILITY.md) | Accepted/discarded optional fields and preserved semantic data |

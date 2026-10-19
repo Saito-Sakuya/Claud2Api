@@ -123,6 +123,7 @@ async fn run_worker(config: Config) -> claud2api::error::Result<()> {
             .await
     });
     let completed = tokio::select! {_=signal()=>0,_=worker_stop.cancelled()=>0,_=&mut public=>1,_=&mut private=>2};
+    worker_stop.cancel();
     shutdown.cancel();
     public_handle.graceful_shutdown(Some(Duration::from_secs(5)));
     private_handle.graceful_shutdown(Some(Duration::from_secs(5)));

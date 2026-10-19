@@ -1,12 +1,15 @@
 pub mod browser;
+mod client_tools;
 pub mod compat;
 pub mod config;
 pub mod control;
 pub mod engine;
 pub mod error;
 pub mod guard;
+pub mod media;
 pub mod models;
 pub mod native_files;
+pub mod native_output;
 pub mod native_stream;
 pub mod native_tools;
 pub mod observability;
