@@ -2,20 +2,22 @@
 
 [中文](RELEASES_ZH.md) · English · [Documentation index](DOCS.md)
 
-Current version: **v0.1.0-alpha.5**. Linux AMD64 is supported; these are Alpha prereleases.
+Current version: **v0.1.0-alpha.6**. Linux AMD64 is supported; these are Alpha prereleases.
 
 ## Versions
 
 - **alpha4**: Chat/Responses text compatibility, durable sessions, the console and container packaging fixes.
 - **alpha5**: adds native web tools, citations, generated-file downloads and explicitly selected project knowledge. Project search has mock coverage but has not been tested with a real project.
 
+- **alpha6**: makes current native tool names explicit, separates client and web tools, and corrects misleading historical claims about unavailable search.
+
 ## Docker images
 
 ```sh
-docker pull ghcr.io/saito-sakuya/claud2api:0.1.0-alpha.5
+docker pull ghcr.io/saito-sakuya/claud2api:0.1.0-alpha.6
 ```
 
-Use `0.1.0-alpha.4` for alpha4 or `0.1.0-alpha.5` for alpha5. Matching `v`-prefixed tags are also provided.
+Use `0.1.0-alpha.4` for alpha4, `0.1.0-alpha.5` for alpha5, or `0.1.0-alpha.6` for alpha6. Matching `v`-prefixed tags are also provided.
 Pin a specific version and follow [README](README_EN.md) for configuration. The image contains the verified binary from the same Release.
 
 ## Downloads

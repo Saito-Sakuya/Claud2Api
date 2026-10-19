@@ -2,6 +2,12 @@
 
 [中文](CHANGELOG.md) · English · [Documentation index](DOCS.md)
 
+## v0.1.0-alpha.6 · 2026-10-19
+
+- Include enabled native tool names on every turn and distinguish Desktop's `WebSearch` from native `web_search`.
+- Clarify that earlier assistant denials do not define current tool availability; permitted searches require actual calls and honest failure reporting.
+- Add regression coverage for tool names, preserved history and disabled capabilities. All 149 tests, Clippy and the release build pass.
+
 ## v0.1.0-alpha.5 · 2026-10-19
 
 - Add native web search/fetch, Artifacts, remote code/files, 37 web widgets and explicitly selected project knowledge.

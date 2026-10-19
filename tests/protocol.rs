@@ -642,6 +642,38 @@ fn native_context_is_omitted_when_disabled_and_changes_when_enabled() {
     assert!(input.prompt("n").contains("<tool_call_n>"));
 }
 #[test]
+fn current_native_capabilities_are_separate_from_client_tools_and_historical_denials() {
+    let mut raw = request();
+    raw["tools"] = json!([{
+        "name":"WebSearch",
+        "description":"Search using the client runtime.",
+        "input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
+    }]);
+    raw["messages"] = json!([
+        {"role":"user","content":"Search for the Rust website."},
+        {"role":"assistant","content":"This conversation has no search tool."},
+        {"role":"user","content":"Please actually search now."}
+    ]);
+    let mut input = protocol::parse(&raw).unwrap();
+    input.native_tools = vec!["web_search".to_owned()];
+    let prompt = input.prompt("current-capabilities");
+    let envelope: Value = serde_json::from_str(prompt.lines().last().unwrap()).unwrap();
+    assert_eq!(envelope["client_tools"][0]["name"], "WebSearch");
+    let names = envelope["native_tool_names"].as_array().unwrap();
+    assert!(names.contains(&json!("web_search")));
+    assert!(names.contains(&json!("web_fetch")));
+    assert!(!names.contains(&json!("WebSearch")));
+    assert!(!names.contains(&json!("bash_tool")));
+    assert_eq!(
+        envelope["history"][1]["content"][0]["text"],
+        "This conversation has no search tool."
+    );
+    input.native_tools.clear();
+    let prompt = input.prompt("disabled-capabilities");
+    let envelope: Value = serde_json::from_str(prompt.lines().last().unwrap()).unwrap();
+    assert!(envelope.get("native_tool_names").is_none());
+}
+#[test]
 fn tool_decoder_native_boundary_flushes_text_and_rejects_partial_frames() {
     let mut required = tool_request();
     required["tool_choice"] = json!({"type":"any"});
